@@ -2391,6 +2391,26 @@ spawn_current_path() {  # <target>
     cmux) fm_backend_cmux_current_path "$1" "$W" ;;
   esac
 }
+# spawn_discover_path: the worktree-DISCOVERY reader. Passive first, exactly as
+# before; only when the backend's passive channel yields nothing does it fall
+# back to an ACTIVE probe that types into the pane.
+#
+# Kept separate from spawn_current_path on purpose. spawn_current_path is also
+# the relaunch reader, and relaunch adopts an EXISTING endpoint whose pane may
+# hold a live agent - an active probe there would submit text into that agent's
+# composer. Only this function, called only from the treehouse-get wait below
+# (where the pane is a shell prompt firstmate itself just opened), may probe.
+spawn_discover_path() {  # <target>
+  local p
+  p=$(spawn_current_path "$1" || true)
+  if [ -n "$p" ]; then
+    printf '%s' "$p"
+    return 0
+  fi
+  case "$BACKEND" in
+    herdr) fm_backend_herdr_probe_path "$1" ;;
+  esac
+}
 spawn_send_literal() {  # <target> <text>
   case "$BACKEND" in
     tmux) fm_backend_tmux_send_literal "$1" "$2" ;;
@@ -2510,7 +2530,7 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   # inter-poll sleep as confirmation, not a whole extra cycle on top.
   candidate=""
   for _ in $(seq 1 60); do
-    p=$(spawn_current_path "$WT_TARGET" || true)
+    p=$(spawn_discover_path "$WT_TARGET" || true)
     if [ -n "$p" ]; then
       p_real=$(real_path_or_raw "$p")
       if [ "$p_real" != "$PROJ_ABS_REAL" ]; then

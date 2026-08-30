@@ -675,13 +675,61 @@ fm_backend_herdr_presentation_lock_namespace_uid() {
   fi
 }
 
+# fm_backend_herdr_presentation_lock_namespace_mode_representable: 1 when this
+# filesystem can actually carry POSIX mode bits, 0 when it cannot.
+#
+# Git for Windows mounts both / and /tmp `noacl` (see `mount`), so a directory
+# always stats as 755 no matter what `mkdir -m 700` or `chmod 700` asked for -
+# measured, chmod returns 0 and the mode does not move. A literal
+# `[ "$mode" = 700 ]` therefore fails forever there, which is why every spawn
+# warned "presentation focus lock unavailable" and, worse, why teardown REFUSED
+# outright ("session presentation lock could not be resolved") and left the pane
+# and the pooled worktree behind.
+#
+# Probed rather than guessed from `uname`: an acl-mounted path on the same
+# machine keeps the strict check.
+fm_backend_herdr_presentation_lock_namespace_mode_representable() {  # <dir>
+  local parent probe mode
+  parent=$(dirname "$1")
+  probe=$(mktemp -d "$parent/.fm-modeprobe.XXXXXX" 2>/dev/null) || return 1
+  chmod 700 "$probe" 2>/dev/null
+  mode=$(fm_backend_herdr_presentation_lock_namespace_mode "$probe")
+  rmdir "$probe" 2>/dev/null
+  [ "$mode" = 700 ]
+}
+
 fm_backend_herdr_presentation_lock_namespace_valid() {
   local dir=$1 expected_uid owner mode
   [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
   expected_uid=$(id -u 2>/dev/null) || return 1
   owner=$(fm_backend_herdr_presentation_lock_namespace_uid "$dir") || return 1
   mode=$(fm_backend_herdr_presentation_lock_namespace_mode "$dir") || return 1
-  [ "$owner" = "$expected_uid" ] && [ "$mode" = 700 ]
+  [ "$owner" = "$expected_uid" ] || return 1
+  [ "$mode" = 700 ] && return 0
+  # Mode is not 700. Only accept that when the filesystem provably cannot carry
+  # mode bits at all; a real 755 on a capable filesystem is still refused. The
+  # confidentiality this check buys is not lost on Windows, it is just enforced
+  # elsewhere: /tmp maps to %TEMP% (C:\Users\<user>\AppData\Local\Temp), which is
+  # already a per-user directory, and the ownership assertion above still holds.
+  if fm_backend_herdr_presentation_lock_namespace_mode_representable "$dir"; then
+    return 1
+  fi
+  # Modes are not representable here, and on such a mount `stat` is uninformative
+  # in BOTH fields: measured on Git for Windows, every directory - /c/Windows and
+  # /c/Program Files included - reports the caller's own uid and mode 755. So the
+  # ownership assertion above proves nothing either, and the guarantee has to be
+  # anchored on LOCATION instead of on metadata: the namespace must sit inside
+  # this user's own temp root, which on Windows is %TEMP%
+  # (C:\Users\<user>\AppData\Local\Temp) and is ACL-protected per user by the OS.
+  # Anything outside it is refused, so a namespace pointed at a shared or system
+  # directory is still rejected on the very platform where stat cannot say so.
+  local real root
+  real=$(cd "$dir" 2>/dev/null && pwd -P) || return 1
+  root=$(cd /tmp 2>/dev/null && pwd -P) || return 1
+  case "$real/" in
+    "$root"/*) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # Resolve the one verified running named-session socket path as an absolute
@@ -701,6 +749,20 @@ fm_backend_herdr_canonical_socket_path() {  # <socket-path>
   [ -n "$socket" ] || return 1
   case "$socket" in
     /*) ;;
+    [A-Za-z]:[\\/]*)
+      # Windows: herdr emits a NATIVE path on both sides of the identity check -
+      # the injected HERDR_SOCKET_PATH and the .socket_path from
+      # `herdr session list --json` are both "C:\Users\...\herdr.sock". Neither is
+      # under the caller's control, so there is no environment workaround. Fold
+      # the drive form into the POSIX form that the dirname/cd/pwd -P logic below
+      # already expects; every other shape stays refused.
+      command -v cygpath >/dev/null 2>&1 || return 1
+      socket=$(cygpath -u "$socket" 2>/dev/null) || return 1
+      case "$socket" in
+        /*) ;;
+        *) return 1 ;;
+      esac
+      ;;
     *) return 1 ;;
   esac
   sock_dir=$(dirname "$socket")
@@ -1783,7 +1845,8 @@ fm_backend_herdr_workspace_ensure() {  # <session> <cwd> [<launcher-relationship
     printf '%s' "$wsid"
     return 0
   fi
-  out=$(fm_backend_herdr_cli "$session" workspace create --cwd "$cwd" --label "$label" --no-focus 2>/dev/null) || return 1
+  fm_backend_herdr_posix_env_args
+  out=$(fm_backend_herdr_cli "$session" workspace create --cwd "$cwd" --label "$label" --no-focus ${FM_BACKEND_HERDR_ENV_ARGS[@]+"${FM_BACKEND_HERDR_ENV_ARGS[@]}"} 2>/dev/null) || return 1
   wsid=$(printf '%s' "$out" | jq -r '.result.workspace.workspace_id // empty' 2>/dev/null)
   [ -n "$wsid" ] || return 1
   FM_BACKEND_HERDR_WS_ID=$wsid
@@ -2020,7 +2083,8 @@ fm_backend_herdr_create_task() {  # <container> <label> <cwd> <seeded_default_ta
 $dup_tabs
 EOF
   fi
-  out=$(fm_backend_herdr_cli "$session" tab create --workspace "$wsid" --cwd "$cwd" --label "$label" --no-focus 2>/dev/null) || return 1
+  fm_backend_herdr_posix_env_args
+  out=$(fm_backend_herdr_cli "$session" tab create --workspace "$wsid" --cwd "$cwd" --label "$label" --no-focus ${FM_BACKEND_HERDR_ENV_ARGS[@]+"${FM_BACKEND_HERDR_ENV_ARGS[@]}"} 2>/dev/null) || return 1
   tab_id=$(printf '%s' "$out" | jq -r '.result.tab.tab_id // empty' 2>/dev/null)
   pane_id=$(printf '%s' "$out" | jq -r '.result.root_pane.pane_id // empty' 2>/dev/null)
   if [ -z "$tab_id" ] || [ -z "$pane_id" ]; then
@@ -2086,7 +2150,8 @@ fm_backend_herdr_projection_create_task() {  # <cwd> <workspace-label> <task-lab
     echo "error: herdr presentation workspace create could not capture exact active workspace and tab; refusing a focus-unsafe projection" >&2
     return 1
   }
-  if out=$(fm_backend_herdr_cli "$session" workspace create --cwd "$cwd" --label "$workspace_label" --no-focus 2>/dev/null); then
+  fm_backend_herdr_posix_env_args
+  if out=$(fm_backend_herdr_cli "$session" workspace create --cwd "$cwd" --label "$workspace_label" --no-focus ${FM_BACKEND_HERDR_ENV_ARGS[@]+"${FM_BACKEND_HERDR_ENV_ARGS[@]}"} 2>/dev/null); then
     :
   else
     fm_backend_herdr_projection_focus_restore "$session" "$focus_before" "workspace create" || true
@@ -2113,9 +2178,10 @@ fm_backend_herdr_projection_create_task() {  # <cwd> <workspace-label> <task-lab
     echo "error: herdr presentation task-tab create could not capture exact active workspace and tab; refusing a focus-unsafe projection" >&2
     return 1
   }
+  fm_backend_herdr_posix_env_args
   if out=$(fm_backend_herdr_cli "$session" tab create \
     --workspace "$FM_BACKEND_HERDR_PROJECTION_WORKSPACE_ID" \
-    --cwd "$cwd" --label "$task_label" --no-focus 2>/dev/null); then
+    --cwd "$cwd" --label "$task_label" --no-focus ${FM_BACKEND_HERDR_ENV_ARGS[@]+"${FM_BACKEND_HERDR_ENV_ARGS[@]}"} 2>/dev/null); then
     :
   else
     fm_backend_herdr_projection_focus_restore "$session" "$focus_before" "task-tab create" || true
@@ -2334,8 +2400,9 @@ fm_backend_herdr_projection_reclaim_task() {  # <session> <journal> <task-id> <h
     echo "warning: herdr presentation reclaim for $id would replace the active tab; spawning flat" >&2
     return 2
   fi
+  fm_backend_herdr_posix_env_args
   if ! out=$(fm_backend_herdr_cli "$session" tab create \
-    --workspace "$meta_workspace" --cwd "$cwd" --label "$task_label" --no-focus 2>/dev/null); then
+    --workspace "$meta_workspace" --cwd "$cwd" --label "$task_label" --no-focus ${FM_BACKEND_HERDR_ENV_ARGS[@]+"${FM_BACKEND_HERDR_ENV_ARGS[@]}"} 2>/dev/null); then
     fm_backend_herdr_projection_focus_restore "$session" "$focus_before" "husk replacement create" || return 1
     echo "warning: herdr presentation reclaim for $id could not create an exact replacement; spawning flat" >&2
     return 2
@@ -2535,6 +2602,132 @@ fm_backend_herdr_current_path() {  # <target>
   fm_backend_herdr_target_ready "$1" || return 0
   fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane get "$FM_BACKEND_HERDR_PANE" 2>/dev/null \
     | jq -r '.result.pane.foreground_cwd // empty' 2>/dev/null
+}
+
+# fm_backend_herdr_probe_path: ACTIVE cwd probe, for platforms where herdr
+# never populates .foreground_cwd. Types a marked `echo` into the pane and
+# reads the answer back off the terminal, the same strategy
+# fm_backend_zellij_current_path uses for a backend with no live-cwd field.
+#
+# Measured on Windows (herdr 0.8.0-preview.2026-08-04, native, not WSL): all
+# three passive channels fail, so the poll in fm-spawn.sh can never terminate.
+#   - `.pane.foreground_cwd` is declared ["string","null"] in `herdr api
+#     schema` but emitted for 0 of 27 panes, absent from `api snapshot`, and
+#     still absent while a foreground process demonstrably runs in another
+#     directory.
+#   - `.pane.cwd` DOES follow a cd run in the pane's own shell here (contrary
+#     to this adapter's note above), but NOT into the nested cmd.exe subshell
+#     `treehouse get` opens - so it is no help at the one place it is needed.
+#   - `pane process-info`'s foreground_processes reports the pane's own shell
+#     (pwsh), not that nested subshell: Windows has no tty foreground process
+#     group for herdr to resolve.
+#
+# DISCOVERY-ONLY - never call this from the relaunch path. Relaunch adopts an
+# EXISTING endpoint whose pane may hold a live agent, and `pane run` submits;
+# typing a probe there would inject text straight into that agent's composer.
+# The passive fm_backend_herdr_current_path stays the only reader there, and
+# on a platform with no foreground_cwd it returns empty so relaunch refuses -
+# loudly wrong beats silently wrong.
+#
+# The cmd.exe form is the only one sent, deliberately: at the single call site
+# the foreground shell is known, because `treehouse get` has just opened it and
+# on Windows that is cmd.exe. Any other shell echoes the marker line back with
+# a literal %CD% in it, which is filtered out, and the function returns empty
+# rather than guessing. The answer is converted to a POSIX path so the
+# real_path_or_raw comparison and validate_spawn_worktree downstream keep
+# working on the same path vocabulary as PROJ_ABS_REAL.
+# fm_backend_herdr_posix_env: the env pairs a task pane must inherit on Windows,
+# one KEY=VALUE per line, or nothing at all anywhere else.
+#
+# Why SHELL: `treehouse get` opens a subshell chosen from $SHELL, and on a herdr
+# pane running pwsh with no SHELL set it falls back to %COMSPEC% - cmd.exe.
+# fm-spawn.sh then types POSIX into that subshell (`export GOTMPDIR=`,
+# `env -u ... claude "$(...)"`), cmd.exe answers "'export' is not recognized",
+# and the crewmate NEVER LAUNCHES while the spawn still exits 0.
+#
+# Why PATH: pinning SHELL alone is not enough. treehouse execs bash.exe directly,
+# not as a login shell, so /etc/profile never runs and the msys toolchain is
+# absent - measured, that bash cannot find `ls`, `head`, or `env`, and the launch
+# line dies twice over ("env: command not found", plus "No such file or
+# directory" for fm-operational-input.sh because its `#!/usr/bin/env bash`
+# interpreter is missing). Handing the pane firstmate's OWN PATH in Windows form
+# gives that subshell the same toolchain firstmate itself is running under.
+#
+# Windows-only by construction: prints nothing without cygpath, without a SHELL
+# to convert, or when the conversion is not a drive path - so on Linux/macOS the
+# caller passes no --env at all and the already-correct inherited environment is
+# left untouched.
+fm_backend_herdr_posix_env() {
+  local win pathw
+  command -v cygpath >/dev/null 2>&1 || return 0
+  [ -n "${SHELL:-}" ] || return 0
+  win=$(cygpath -w "$SHELL" 2>/dev/null) || return 0
+  case "$win" in
+    [A-Za-z]:?*) ;;
+    *) return 0 ;;
+  esac
+  printf 'SHELL=%s\n' "$win"
+  # Why MSYS: fm_lock_try_create's primitive is `ln -s`, and msys defaults to
+  # silently COPYING instead of linking. The copy still carries the owner's pid
+  # file, so fm_lock_try_acquire reads its own pid out of a lock it never took,
+  # and fm_lock_acquire_wait (bin/fm-wake-lib.sh - no timeout, no bail-out)
+  # spins forever. Measured in isolation: without this variable
+  # fm_lock_acquire_wait never returns; with it the lock is a real symlink and
+  # acquires immediately. Native symlinks additionally need Developer Mode or
+  # elevation - without either, `ln -s` at least fails LOUDLY under nativestrict
+  # instead of leaving a booby-trapped directory behind.
+  printf 'MSYS=winsymlinks:nativestrict\n'
+  pathw=$(cygpath -w -p "$PATH" 2>/dev/null) || return 0
+  [ -n "$pathw" ] && printf 'PATH=%s\n' "$pathw"
+  return 0
+}
+
+# fm_backend_herdr_posix_env_args: fm_backend_herdr_posix_env's pairs as a
+# ready-to-splice argv array in FM_BACKEND_HERDR_ENV_ARGS - empty on every
+# platform that needs no override, so callers splice it unconditionally with
+# ${FM_BACKEND_HERDR_ENV_ARGS[@]+"${FM_BACKEND_HERDR_ENV_ARGS[@]}"} and pass no
+# --env at all off Windows. A bash function cannot return an array, and every
+# pane-creating call site needs the same one, so the array is set here rather
+# than rebuilt inline five times.
+fm_backend_herdr_posix_env_args() {
+  local line
+  FM_BACKEND_HERDR_ENV_ARGS=()
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    FM_BACKEND_HERDR_ENV_ARGS+=(--env "$line")
+  done <<ENVPAIRS
+$(fm_backend_herdr_posix_env)
+ENVPAIRS
+}
+
+fm_backend_herdr_probe_path() {  # <target>
+  local out raw form
+  command -v cygpath >/dev/null 2>&1 || return 0
+  fm_backend_herdr_target_ready "$1" || return 0
+  # POSIX form first: with SHELL exported into the pane (see
+  # fm_backend_herdr_posix_shell_env) `treehouse get` opens bash, so this is the
+  # normal case. The cmd.exe form stays as the fallback for a pane that never
+  # got that env - it is the shape verified live before the env fix existed.
+  for form in \
+    'printf "__FM_CWD_B__%s__FM_CWD_E__\n" "$PWD"' \
+    'echo __FM_CWD_B__%CD%__FM_CWD_E__'
+  do
+    fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane run "$FM_BACKEND_HERDR_PANE" "$form" >/dev/null 2>&1 || continue
+    sleep 1
+    out=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane read "$FM_BACKEND_HERDR_PANE" 2>/dev/null) || continue
+    # Last capture between the markers. The typed command echoes back too,
+    # carrying whichever placeholder the wrong shell failed to expand
+    # (%CD%, $PWD, or printf's own %s), so accept ONLY an absolute path shape
+    # rather than trying to enumerate the placeholders.
+    raw=$(printf '%s\n' "$out" \
+      | sed -n 's/.*__FM_CWD_B__\(.*\)__FM_CWD_E__.*/\1/p' \
+      | tail -1)
+    case "$raw" in
+      /*) printf '%s' "$raw"; return 0 ;;
+      [A-Za-z]:?*) cygpath -u "$raw" 2>/dev/null && return 0 ;;
+    esac
+  done
+  return 0
 }
 
 # fm_backend_herdr_send_text_line: send one line of TEXT then submit,

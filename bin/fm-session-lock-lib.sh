@@ -16,6 +16,12 @@
 # shellcheck source=bin/fm-cursor-lib.sh
 . "$(dirname -- "${BASH_SOURCE[0]}")/fm-cursor-lib.sh"
 
+# Process-table access (comm / args / ppid / liveness) is platform-specific and
+# owned by fm-ps-lib.sh. On Windows it also fixes this file's pid namespace to
+# WINPID - read that file's PID NAMESPACE note before changing anything here.
+# shellcheck source=bin/fm-ps-lib.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/fm-ps-lib.sh"
+
 # Known harness command names; extend when a new adapter is verified.
 FM_HARNESS_RE='claude|codex|opencode|grok|kimi|^pi$|^pi-signed$'
 
@@ -61,8 +67,14 @@ FM_HARNESS_IS_CLAUDE=0
 fm_harness_process_matches() {  # <comm> <args>
   local comm=$1 args=$2 base argv0 name
   FM_HARNESS_IS_CLAUDE=0
-  base=$(basename -- "$comm")
-  if printf '%s' "$base" | grep -qE "$FM_HARNESS_RE"; then
+  # Builtins, not `basename` and `grep`. This runs once per ancestry hop and the
+  # walk is on the Claude Stop hook's path at every turn end; under MSYS, where
+  # each fork is a real Windows process costing ~85ms, the three spawns this used
+  # to make per hop dominated the whole walk. Bash's =~ is ERE, same as grep -E,
+  # and the pattern must stay unquoted to be read as a regex.
+  base=${comm%/}
+  base=${base##*/}
+  if [[ $base =~ $FM_HARNESS_RE ]]; then
     case "$base" in *claude*) FM_HARNESS_IS_CLAUDE=1 ;; esac
     return 0
   fi
@@ -74,7 +86,7 @@ fm_harness_process_matches() {  # <comm> <args>
   # Bare interpreter (e.g. node): match the harness name in its script path.
   case "$comm" in
     *node*|*python*)
-      if printf '%s' "$args" | grep -qE "$FM_HARNESS_RE"; then
+      if [[ $args =~ $FM_HARNESS_RE ]]; then
         case "$args" in *claude*) FM_HARNESS_IS_CLAUDE=1 ;; esac
         return 0
       fi
@@ -107,10 +119,17 @@ fm_harness_process_matches() {  # <comm> <args>
 # session cannot be read off the ancestry at all, so the whole contiguous run is
 # reported and the callers below decide what they need from it.
 fm_harness_ancestry_pids() {
-  local pid=$$ comm args extending=0 printed=0
+  local pid next comm args extending=0 printed=0
+  # Every snapshot call must run in THIS shell: the per-hop reads below happen
+  # in $( ) subshells that inherit a populated table but cannot publish one
+  # back, so a snapshot taken there would be retaken on every single read.
+  # fm_ps_self_pid assigns for the same reason - through $( ) it would name a
+  # subshell that is dead before the walk reads the table.
+  fm_ps_self_pid pid || return 1
+  fm_ps_cyg_ensure || true
   for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
-    comm=$(ps -o comm= -p "$pid" 2>/dev/null) || break
-    args=$(ps -o args= -p "$pid" 2>/dev/null)
+    # One combined lookup per hop; see fm_ps_hop for why this is not three calls.
+    fm_ps_hop "$pid" comm args next || break
     if fm_harness_process_matches "$comm" "$args"; then
       printf '%s\n' "$pid"
       printed=1
@@ -119,8 +138,8 @@ fm_harness_ancestry_pids() {
     elif [ "$extending" -eq 1 ]; then
       break
     fi
-    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
-    [ -n "$pid" ] && [ "$pid" -gt 1 ] || break
+    [ -n "$next" ] && [ "$next" -gt 1 ] || break
+    pid=$next
   done
   [ "$printed" -eq 1 ]
 }
@@ -146,9 +165,12 @@ EOF
 # True if $1 is a live process that looks like a verified harness.
 fm_harness_pid_alive() {
   local pid=$1 comm args
-  kill -0 "$pid" 2>/dev/null || return 1
-  comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 1
-  args=$(ps -o args= -p "$pid" 2>/dev/null)
+  # Never `kill -0` here: on Windows this pid is a WINPID, which Cygwin kill
+  # cannot resolve - it answers 1 for a live harness and for a dead one alike.
+  fm_ps_pid_alive "$pid" || return 1
+  fm_ps_cyg_ensure || true
+  comm=$(fm_ps_comm "$pid") || return 1
+  args=$(fm_ps_args "$pid")
   fm_harness_process_matches "$comm" "$args"
 }
 

@@ -16,22 +16,29 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 . "$SCRIPT_DIR/fm-primary-scope-lib.sh"
 # shellcheck source=bin/fm-operational-input.sh
 . "$SCRIPT_DIR/fm-operational-input.sh"
+# Process-table access is platform-specific; fm-ps-lib.sh owns it and the pid
+# namespace the ancestry comparison below runs in.
+# shellcheck source=bin/fm-ps-lib.sh
+. "$SCRIPT_DIR/fm-ps-lib.sh"
 
 fm_is_gate_agent "$FM_ROOT" && exit 0
 fm_primary_scope_matches "$FM_ROOT" "$STATE" || exit 0
 
 lock_is_in_ancestry() {
-  local lock_pid pid=$$ _
+  local lock_pid pid next comm args _
   [ -f "$STATE/.lock" ] || return 1
   IFS= read -r lock_pid < "$STATE/.lock" 2>/dev/null || return 1
   case "$lock_pid" in
     ''|*[!0-9]*|1) return 1 ;;
   esac
-  kill -0 "$lock_pid" 2>/dev/null || return 1
+  fm_ps_pid_alive "$lock_pid" || return 1
+  fm_ps_self_pid pid || return 1
+  fm_ps_cyg_ensure || true
   for _ in 1 2 3 4 5 6 7 8; do
     [ "$pid" = "$lock_pid" ] && return 0
-    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
-    [ -n "$pid" ] && [ "$pid" -gt 1 ] || return 1
+    fm_ps_hop "$pid" comm args next || return 1
+    [ -n "$next" ] && [ "$next" -gt 1 ] || return 1
+    pid=$next
   done
   return 1
 }

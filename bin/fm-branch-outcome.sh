@@ -442,7 +442,7 @@ case "$CMD" in
       echo "error: silent outcomes must be routine fleet outcomes" >&2
       exit 2
     fi
-    fm_lock_acquire_wait "$LOCK"
+    fm_lock_acquire_wait_or_die "$LOCK"
     if ! LAST_SEQ=$(last_seq); then
       fm_lock_release "$LOCK"
       echo "error: refusing append because the outcome store is malformed or non-sequential" >&2
@@ -470,7 +470,7 @@ case "$CMD" in
     ;;
   unread)
     [ "$#" -eq 0 ] || usage
-    fm_lock_acquire_wait "$LOCK"
+    fm_lock_acquire_wait_or_die "$LOCK"
     print_unread
     fm_lock_release "$LOCK"
     ;;
@@ -479,7 +479,7 @@ case "$CMD" in
     THROUGH=${2:-}
     bounded_uint "$THROUGH" || usage
     [ "$#" -eq 2 ] || usage
-    fm_lock_acquire_wait "$LOCK"
+    fm_lock_acquire_wait_or_die "$LOCK"
     if ! LAST_SEQ=$(last_seq); then
       fm_lock_release "$LOCK"
       echo "error: refusing cursor advancement because the outcome store is malformed or non-sequential" >&2
@@ -507,7 +507,7 @@ case "$CMD" in
     ;;
   unprocessed)
     [ "$#" -eq 0 ] || usage
-    fm_lock_acquire_wait "$LOCK"
+    fm_lock_acquire_wait_or_die "$LOCK"
     print_unprocessed
     STATUS=$?
     fm_lock_release "$LOCK"
@@ -518,7 +518,7 @@ case "$CMD" in
     THROUGH=${2:-}
     bounded_uint "$THROUGH" || usage
     [ "$#" -eq 2 ] || usage
-    fm_lock_acquire_wait "$LOCK"
+    fm_lock_acquire_wait_or_die "$LOCK"
     if ! CURSOR_SEQ=$(read_cursor) || ! PROCESSED_SEQ=$(read_processed); then
       fm_lock_release "$LOCK"
       exit 1
@@ -565,7 +565,7 @@ case "$CMD" in
     fi
     [ "$#" -eq 0 ] || usage
     if [ "$HELD_LOCK" -eq 0 ]; then
-      fm_lock_acquire_wait "$LOCK"
+      fm_lock_acquire_wait_or_die "$LOCK"
     elif ! held_lock_owned_by_ancestor; then
       echo "error: --held-lock requires an ancestor process to own the outcome lock" >&2
       exit 1
@@ -588,7 +588,7 @@ case "$CMD" in
       shift 2 || usage
     fi
     [ "$#" -eq 0 ] || usage
-    fm_lock_acquire_wait "$LOCK"
+    fm_lock_acquire_wait_or_die "$LOCK"
     if ! last_seq >/dev/null; then
       fm_lock_release "$LOCK"
       echo "error: refusing read because the outcome store is malformed or non-sequential" >&2
@@ -601,7 +601,7 @@ case "$CMD" in
     ;;
   startup-replay)
     [ "$#" -eq 0 ] || usage
-    fm_lock_acquire_wait "$LOCK"
+    fm_lock_acquire_wait_or_die "$LOCK"
     UNREAD=$(print_unread)
     if [ -n "$UNREAD" ]; then
       REPLAYABLE=$(printf '%s\n' "$UNREAD" | jq -sc '

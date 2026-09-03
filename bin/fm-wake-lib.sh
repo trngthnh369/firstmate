@@ -434,6 +434,37 @@ fm_lock_remove_stray_owner_link() {
   fi
 }
 
+# Prove, once per process and on a throwaway path, whether this host publishes
+# real symlinks. Detecting it from an attempt at the lock path itself is not
+# safe under concurrency: a second racer's copy lands INSIDE the first one, so
+# neither can remove the directory it created and both back off from an unowned
+# lock path. Probing costs one process its own three spawns, once, and keeps
+# that damage away from every real lock.
+# An unwritable directory reports native, so the ordinary create path runs and
+# fails on its own terms rather than on a probe.
+fm_lock_symlinks_degraded() {  # <directory>
+  local dir=$1 owner link
+  if [ "$FM_LOCK_SYMLINK_MODE" = unknown ]; then
+    FM_LOCK_SYMLINK_MODE=native
+    if owner=$(mktemp -d "$dir/.fm-symprobe.XXXXXX" 2>/dev/null); then
+      link="$owner.link"
+      if ln -s "$owner" "$link" 2>/dev/null && [ -L "$link" ]; then
+        rm -f "$link" 2>/dev/null || true
+      else
+        FM_LOCK_SYMLINK_MODE=degraded
+        if [ -d "$link" ] && [ ! -L "$link" ]; then
+          fm_lock_clean_known_files "$link"
+          rmdir "$link" 2>/dev/null || true
+        else
+          rm -f "$link" 2>/dev/null || true
+        fi
+      fi
+      rmdir "$owner" 2>/dev/null || true
+    fi
+  fi
+  [ "$FM_LOCK_SYMLINK_MODE" = degraded ]
+}
+
 # Do we still hold this lock or steal? The symlink protocol proves it from the
 # link target; the bare-directory protocol records the directory as its own
 # owner, so there is no target and the pid is the proof.
@@ -466,15 +497,18 @@ fm_lock_reap_degraded_copy() {
   if [ -d "$lockdir" ] && [ ! -L "$lockdir" ] \
     && [ "$(cat "$lockdir/pid" 2>/dev/null || true)" = "$mypid" ]; then
     fm_lock_clean_known_files "$lockdir"
-    rmdir "$lockdir" 2>/dev/null || true
-    return 0
+    # Report only what we actually removed. A concurrent racer's copy can be
+    # nested inside ours, and rmdir then fails; claiming success there leaves an
+    # unowned directory at the lock path that every racer backs off from.
+    rmdir "$lockdir" 2>/dev/null
+    return
   fi
   nested="$lockdir/${ownerdir##*/}"
   if [ -d "$nested" ] && [ ! -L "$nested" ] \
     && [ "$(cat "$nested/pid" 2>/dev/null || true)" = "$mypid" ]; then
     fm_lock_clean_known_files "$nested"
-    rmdir "$nested" 2>/dev/null || true
-    return 0
+    rmdir "$nested" 2>/dev/null
+    return
   fi
   return 1
 }
@@ -534,12 +568,13 @@ fm_lock_claim() {
 }
 
 fm_lock_try_create() {
-  local lockdir=$1 allowed_steal_owner=${2:-} ownerdir
+  local lockdir=$1 allowed_steal_owner=${2:-} ownerdir dir
   FM_LOCK_OWNER_DIR=
-  # Once proven, a host that cannot publish a symlink uses the bare-directory
-  # protocol. Proving it costs a symlink-capable host nothing: the proof is the
-  # ordinary create attempt below plus one test on its result.
-  if [ "$FM_LOCK_SYMLINK_MODE" = degraded ]; then
+  # A host that cannot publish a symlink uses the bare-directory protocol, where
+  # mkdir is the atomic publication. POSIX hosts never reach this branch.
+  dir=${lockdir%/*}
+  [ "$dir" != "$lockdir" ] || dir=.
+  if fm_lock_symlinks_degraded "$dir"; then
     fm_lock_try_create_bare "$lockdir" "$allowed_steal_owner"
     return
   fi

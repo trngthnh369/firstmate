@@ -255,31 +255,53 @@ test_steal_recursion_is_capped() {
 }
 
 test_single_winner_under_concurrency_on_a_degraded_host() {
-  local dir winners
+  local dir winners violations
   dir=$(make_case degraded-mutex degraded)
+  # Every racer spins on a start file before touching the lock, so they reach
+  # publication together instead of being serialised by process startup.
+  #
+  # The property asserted is mutual EXCLUSION, not a winner count. A racer whose
+  # startup outlasts the hold acquires legitimately after the release, so "how
+  # many ever acquired" is a function of host speed; "did two hold it at once"
+  # is not. Each holder marks the lock occupied and records a violation if it
+  # was already marked.
   in_case "$dir" '
     lock="$FM_STATE_OVERRIDE/.race.lock"
     wins="$FM_STATE_OVERRIDE/wins"
+    bad="$FM_STATE_OVERRIDE/violations"
+    occupied="$FM_STATE_OVERRIDE/occupied"
+    start="$FM_STATE_OVERRIDE/start"
     : > "$wins"
+    : > "$bad"
     i=0
     while [ "$i" -lt 8 ]; do
       (
+        while [ ! -e "$start" ]; do :; done
         if fm_lock_try_acquire "$lock"; then
+          [ -e "$occupied" ] && echo overlap >> "$bad"
+          : > "$occupied"
           echo win >> "$wins"
           sleep 0.3
+          rm -f "$occupied"
           fm_lock_release "$lock"
         fi
       ) &
       i=$((i + 1))
     done
+    : > "$start"
     wait
     exit 0' >/dev/null 2>&1 || fail "degraded concurrency case failed to run"
 
-  winners=$(grep -c win "$dir/state/wins" 2>/dev/null || echo 0)
-  [ "$winners" -eq 1 ] || fail "expected exactly one winner, got $winners"
-  assert_absent "$dir/state/.race.lock" "the winner leaked its lock"
+  # grep -c prints 0 and exits 1 on no match, so a `|| echo 0` fallback would
+  # append a second count; count the lines instead.
+  violations=$(awk '/overlap/ { c++ } END { print c + 0 }' "$dir/state/violations")
+  winners=$(awk '/win/ { c++ } END { print c + 0 }' "$dir/state/wins")
+  [ "$violations" -eq 0 ] || fail "$violations racers held the lock at the same time"
+  [ "$winners" -ge 1 ] || fail "no racer ever acquired the contended lock"
+  assert_absent "$dir/state/.race.lock" "the last holder leaked its lock"
+  assert_absent "$dir/state/.race.lock.steal" "a steal artifact outlived the race"
 
-  pass "exactly one racer wins a contended lock on a degraded host"
+  pass "contended racers never hold a degraded-host lock at the same time"
 }
 
 test_native_host_still_publishes_a_symlink() {

@@ -970,7 +970,8 @@ fm_recovery_marker_reopen_announced() {
 # so the fail-safe rule is the same one the ordinary reclaim path uses: an
 # unreadable pid, a live owner, or an unreadable mtime all mean "not stale".
 fm_lock_steal_is_stale() {
-  local steal=$1 owner= pid
+  local steal=$1 pid
+  local owner=''
   [ -e "$steal" ] || [ -L "$steal" ] || return 1
   pid=$(cat "$steal/pid" 2>/dev/null || true)
   # Cheap early-out for the ordinary contended case. A live holder is never

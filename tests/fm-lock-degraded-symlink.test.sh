@@ -6,6 +6,10 @@
 # The degradation is injected with a PATH shim rather than an environment
 # variable, so these cases exercise the same code path on every host instead of
 # only where MSYS happens to behave this way.
+# Every case body below is deliberately single-quoted: it is a script this file
+# hands to a separate shell, so its expansions must happen THERE and not here.
+# shellcheck disable=SC2016 # Case bodies expand in the target shell, not this one.
+
 set -u
 
 # shellcheck source=tests/lib.sh

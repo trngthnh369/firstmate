@@ -436,6 +436,32 @@ Observed output:
 fm-claude-stop-autoarm: ok
 ```
 
+## Lock primitives on a host without symlinks
+
+Verified 2026-09-03 on Windows 11 26200 under Git Bash (MSYS2 MINGW64), where `ln -s` publishes a directory copy instead of a link unless `MSYS=winsymlinks:nativestrict` is exported.
+The regression suite injects that behaviour with a PATH shim rather than the environment variable, so the same cases run on every host.
+
+```sh
+tests/fm-lock-degraded-symlink.test.sh
+```
+
+Observed guarantee: a degraded `ln -s` still publishes a usable, releasable lock through the bare-directory protocol; a lock directory whose owner is provably dead, or which carries no `pid` file, is reclaimed; a lock held by a live owner is refused and left in place; the blocking acquire gives up at its ceiling naming the path and reason; the fail-closed acquire stops its caller rather than entering a critical section unlocked; steal recovery refuses at its depth cap instead of appending another level; exactly one racer wins a contended lock; and a symlink-capable host still publishes a symlink with no probe residue.
+
+The acquire ceiling's default is sized from this host's measured process-spawn cost, which is what makes ordinary contention slow rather than wedged:
+
+```text
+200 exec /usr/bin/true    9551 ms   (~48 ms each)
+200 command substitutions 9792 ms   (~49 ms each)
+50  bash -c ':'           2714 ms   (~54 ms each)
+```
+
+Ten contenders over a lock held 0.15s were measured waiting up to 85s here on the unchanged symlink path, so a ceiling near that figure would refuse legitimate waits.
+
+Two consequences of the same per-operation cost are recorded here because they are easy to misread as defects.
+A drain of a clean home holding six tasks and an empty queue takes 55s, so `bin/fm-wake-drain.sh` timings in the hundreds of seconds are host speed, not accumulated state.
+`tests/fm-watcher-lock.test.sh`'s 40-way concurrency case reports two winners on this host at and before this change, because spawning its 40 racers takes about 1215ms while the winner holds the lock for 1000ms: the winner exits, its lock names a dead pid, and a late racer legitimately reclaims it.
+Extending that hold past the spawn window makes the case pass, which is the evidence separating a slow host from a mutual-exclusion defect.
+
 ## Watcher continuity
 
 The cross-harness evidence combines the 2026-07-17 live pass with Claude's replacement Stop-owned path revalidated on 2026-07-24, all against isolated project and home state.

@@ -283,7 +283,7 @@ fm_backlog_record_present "$META" "task record" "$STATE" || {
   exit 1
 }
 META_LOCK=$(fm_meta_lock_path "$META") || exit 1
-fm_lock_acquire_wait "$META_LOCK"
+fm_lock_acquire_wait_or_die "$META_LOCK"
 META_LOCK_HELD=1
 fm_backlog_record_present "$META" "task record" "$STATE" || {
   echo "error: teardown refused after locking: $FM_BACKLOG_TRANSITION_ERROR" >&2

@@ -229,3 +229,5 @@ Contributions are welcome - see [CONTRIBUTING.md](CONTRIBUTING.md) for the workf
 ## License
 
 MIT - see [LICENSE](LICENSE).
+
+<!-- temporary CI baseline probe; this branch and PR are deleted after the Lint result is read -->

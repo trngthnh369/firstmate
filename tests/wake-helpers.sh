@@ -87,6 +87,30 @@ if [ "${1:-}" = "capture-pane" ]; then
       _prev=$_arg
     done
   fi
+  # Liveness-beacon probe: record which beacon this pane capture observed, so a
+  # case can assert what the watcher wrote at THIS point of a poll iteration
+  # rather than only at its boundaries. FM_FAKE_TMUX_CAPTURE_SLEEP then holds
+  # the sweep open long enough for whole-second mtimes to tell those points apart.
+  if [ -n "${FM_FAKE_TMUX_CAPTURE_PROBE_LOG:-}" ]; then
+    _beat=${FM_FAKE_TMUX_BEAT:-}
+    if [ "$(uname)" = Darwin ]; then
+      _beat_mtime=$(stat -f %m "$_beat" 2>/dev/null)
+    else
+      _beat_mtime=$(stat -c %Y "$_beat" 2>/dev/null)
+    fi
+    _beat_cycle=$(cat "$_beat" 2>/dev/null || true)
+    _target=
+    _prev=
+    for _arg in "$@"; do
+      [ "$_prev" = -t ] && _target=$_arg
+      _prev=$_arg
+    done
+    printf '%s\t%s\t%s\n' "${_target:-none}" "${_beat_cycle:-none}" "${_beat_mtime:-none}" \
+      >> "$FM_FAKE_TMUX_CAPTURE_PROBE_LOG"
+  fi
+  if [ -n "${FM_FAKE_TMUX_CAPTURE_SLEEP:-}" ]; then
+    sleep "$FM_FAKE_TMUX_CAPTURE_SLEEP"
+  fi
   if [ -n "${FM_FAKE_TMUX_CAPTURE:-}" ]; then
     cat "$FM_FAKE_TMUX_CAPTURE"
   fi
@@ -309,6 +333,12 @@ wait_for_exit() {
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
   return 124
+}
+
+# Portable mtime in epoch seconds. Platform-detected, never the `stat -f || stat -c`
+# fallback (which writes a partial filesystem dump on Linux; see fm-watch.sh).
+file_mtime() {
+  if [ "$(uname)" = Darwin ]; then stat -f %m "$1" 2>/dev/null; else stat -c %Y "$1" 2>/dev/null; fi
 }
 
 is_live_non_zombie() {

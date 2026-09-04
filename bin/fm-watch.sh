@@ -1507,6 +1507,55 @@ printf '%s\n' "$FM_WATCH_DELIVERY_IDENTITY" > "$WATCH_LOCK/pid-identity" 2>/dev/
 
 [ -e "$STATE/.last-heartbeat" ] || touch "$STATE/.last-heartbeat"
 
+# --- Liveness beacon --------------------------------------------------------
+# fm-guard.sh, fm-watch-arm.sh and the auto-arm ladder all decide "a supervision
+# cycle is alive" from state/.last-watcher-beat's AGE against FM_GUARD_GRACE. A
+# poll iteration is not instantaneous: a fleet-sized sweep spends a subprocess
+# per window, per check and per reconciliation, so on a slow-fork host one
+# iteration runs for minutes. A beacon written only at iteration boundaries
+# therefore reports a perfectly healthy cycle as stale for most of its life,
+# which is what made the turn-end guard hold every turn and made an arm abandon
+# a working watcher on its confirmation timeout. Beat at every point the cycle
+# demonstrably moved forward instead, so the beacon's age measures how long this
+# cycle has been UNRESPONSIVE rather than how long its current iteration has run.
+#
+# Two properties this owner must keep:
+#   - Only this process, and only while the singleton lock still names it, ever
+#     beats. No helper or child may write the beacon, or a wedged watcher would
+#     look healthy (docs/watcher-continuity.md). An evicted duplicate stops
+#     beating here and stands down at the next top-of-loop eviction check, which
+#     stays the one place a cycle exits.
+#   - The beat costs no subprocess. It runs in the hot path, so ownership is read
+#     with the `read` builtin and the beacon is written with a plain redirect;
+#     `touch` and `cat` would each add a fork per beat to the very sweep whose
+#     fork cost caused the problem.
+#
+# The beacon's content is the number of the poll iteration currently running
+# (0 before the first). Only mtime decides liveness; the number is what lets an
+# observer tell a mid-iteration beat from a new iteration, which mtime alone
+# cannot express. Every beat within one iteration rewrites the same number.
+WATCHER_BEAT_FILE="$STATE/.last-watcher-beat"
+WATCHER_POLL_CYCLE=0
+
+# The singleton-ownership test shared by the self-eviction guard and every beat.
+# Read with the `read` builtin rather than $(cat ...): this runs many times per
+# iteration, and a fork per call would tax the very hot path the beat reports on.
+watcher_owns_lock() {
+  local held=
+  { read -r held < "$WATCH_LOCK/pid"; } 2>/dev/null
+  [ "$held" = "$WATCHER_PID" ]
+}
+
+beat() {
+  watcher_owns_lock || return 0
+  { printf '%s\n' "$WATCHER_POLL_CYCLE" > "$WATCHER_BEAT_FILE"; } 2>/dev/null || return 0
+}
+
+# Publish liveness as soon as this cycle owns the lock. The startup work below
+# runs before the first iteration, and an arm waiting out FM_ARM_CONFIRM_TIMEOUT
+# for a first beat must not time out on a watcher that is already running.
+beat
+
 # A merged poll may have queued its terminal wake and then lost the process
 # between receipt publication and fixed-path removal.
 # Finish only identity-bound retirement receipts before any check can run.
@@ -1553,13 +1602,14 @@ while :; do
   # no-ops because the lock pid is not ours, so the survivor's lock is untouched.
   # This makes any duplicate self-resolve within one poll instead of persisting
   # and doubling every wake.
-  if [ "$(cat "$WATCH_LOCK/pid" 2>/dev/null || true)" != "$WATCHER_PID" ]; then
+  if ! watcher_owns_lock; then
     exit 0
   fi
 
-  # Liveness beacon for fm-guard.sh: a fresh mtime here means a watcher is
-  # alive. Supervision scripts warn when this goes stale with tasks in flight.
-  touch "$STATE/.last-watcher-beat"
+  # A new iteration is starting; see the beat owner above for what the number
+  # means and why the beats below it are placed where they are.
+  WATCHER_POLL_CYCLE=$((WATCHER_POLL_CYCLE + 1))
+  beat
 
   if [ "$(age_of "$STATE/home-summary.json")" -ge "$HOME_SUMMARY_INTERVAL" ]; then
     home_summary_refresh_detached
@@ -1597,6 +1647,10 @@ while :; do
   # published while this watcher was between cycles.
   procevent_surface_queued
 
+  # The reconciliation block above is the iteration's first long stretch: each
+  # of those ticks can spend several subprocesses before the sweeps even begin.
+  beat
+
   # A process-event result carries richer adapter-owned wake context than the
   # generic recovery reason, so give that owner first refusal.
   resurface_after_downtime
@@ -1613,6 +1667,7 @@ while :; do
   else
     triage_log "inactive-outcome reconciliation unavailable"
   fi
+  beat
 
   # Slow per-task checks (firstmate writes these, e.g. a merged-PR poll).
   # Time-based via .last-check mtime so the cadence survives watcher restarts.
@@ -1625,6 +1680,10 @@ while :; do
     rejected_checks=
     for c in "$STATE"/*.check.sh; do
       [ -e "$c" ] || continue
+      # Each authenticated check is an external command allowed up to
+      # FM_CHECK_TIMEOUT, so a sweep of several outlives the staleness grace on
+      # its own. Finishing one is forward progress.
+      beat
       is_pr_poll=0
       if [ "$(basename "$c")" = x-watch.check.sh ]; then
         if fmx_poll_shim_valid "$c" "$FM_HOME" "$FM_ROOT" \
@@ -1696,8 +1755,12 @@ while :; do
   # costs a full firstmate turn each. The re-scan also picks up a newer
   # signature for an already-pending file (last write wins below).
   pending=$(scan_signals)
+  beat
   if [ -n "$pending" ]; then
     sleep "$SIGNAL_GRACE"
+    # The coalescing linger is a deliberate wait, not a wedge, and FM_SIGNAL_GRACE
+    # is operator-settable; do not let it eat into the staleness grace.
+    beat
     pending=$(printf '%s\n%s' "$pending" "$(scan_signals)")
     # The final coalesced signal set is the watcher-carried status-change
     # trigger for this home's published summary. Start it before either
@@ -1808,6 +1871,12 @@ EOF
   # remembers the hash already classified, or the declaration a busy pane's
   # crossed turn bound already handed to the away-mode daemon).
   while IFS= read -r w; do
+    # The per-window sweep is the iteration's dominant cost: every window below
+    # spends a pane capture and, on a first-sight stale hash, a crew-state read.
+    # Reaching the next window is the finest-grained forward progress this loop
+    # has, and on a large fleet the difference between one beat and one per
+    # window is the difference between a healthy cycle reading stale and not.
+    beat
     kind=$(window_kind "$w")
     task=$(window_to_task "$w" "$STATE")
     # Steering-inbox loss detection runs before the secondmate stale
@@ -2010,6 +2079,7 @@ EOF
   # what. Time-based via .last-heartbeat mtime; interval doubles per consecutive
   # no-change heartbeat (idle fleet) up to HEARTBEAT_MAX, and resets on any
   # surfaced non-heartbeat wake.
+  beat
   streak=$(cat "$STATE/.heartbeat-streak" 2>/dev/null || echo 0)
   [ "$streak" -gt 12 ] && streak=12
   hb=$(( HEARTBEAT * (1 << streak) ))
@@ -2046,6 +2116,9 @@ EOF
   fi
 
   # Terminal wait: a bounded native-event wait for push-capable homes (herdr),
-  # else the blind poll sleep. See event_wait_or_sleep.
+  # else the blind poll sleep. See event_wait_or_sleep. Beat first so the wait
+  # is measured from the end of this iteration's work rather than from whatever
+  # the heartbeat fleet-scan above cost.
+  beat
   event_wait_or_sleep
 done

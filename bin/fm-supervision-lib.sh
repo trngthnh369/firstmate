@@ -5,7 +5,8 @@
 # Reports whether a firstmate home needs supervision because it has in-flight
 # work (a state/<id>.meta exists) or an X-mode relay poll
 # (state/x-watch.check.sh), and whether its watcher has a fresh liveness beacon
-# (state/.last-watcher-beat, touched every poll cycle, within the grace window).
+# (state/.last-watcher-beat, beaten at every point a poll cycle moves forward,
+# within the grace window).
 # bin/fm-turnend-guard.sh uses the PID-strict fm_watcher_healthy from
 # bin/fm-wake-lib.sh for its block decision. bin/fm-guard.sh uses the model-aware
 # fm_watcher_supervision_verdict (also in bin/fm-wake-lib.sh), which owns what a

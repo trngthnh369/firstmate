@@ -69,29 +69,24 @@ wait_live() {
 # machine a short fixed budget can reap a round before the cycle it asserts on
 # ever ran - and then every "no wake, no marker" assertion passes vacuously
 # while every "marker written" assertion fails spuriously.
-# The liveness beacon is touched at the TOP of every poll, so this drops any
-# beacon left by an earlier round, waits for THIS watcher to write a fresh one
-# (some poll's top), then waits for that one to advance (the next poll's top) -
-# and the whole cycle in between is what the caller's assertions describe.
+# The liveness beacon advances DURING an iteration as well as at its top, so its
+# mtime no longer marks a cycle boundary; its CONTENT does - the number of the
+# poll iteration currently running (bin/fm-watch.sh's beat owner). Reading
+# iteration N here means N may already have been under way before the caller
+# finished its setup, so the first iteration guaranteed to have seen that setup
+# is N+1, and N+1 has completed exactly when N+2 starts. That is the same span
+# the mtime form used to describe, so callers keep the guarantee they had.
 # 0 if the watcher is still alive after a completed cycle, 1 if it exited.
 wait_poll_cycle() {  # <state> <pid> [limit-ticks]
-  local state=$1 pid=$2 limit=${3:-300} beat first now i=0
+  local state=$1 pid=$2 limit=${3:-300} beat start now i=0
   beat="$state/.last-watcher-beat"
-  rm -f "$beat"
-  first=""
+  start=$(cat "$beat" 2>/dev/null || true)
+  case "$start" in ''|*[!0-9]*) start=0 ;; esac
   while [ "$i" -lt "$limit" ]; do
     kill -0 "$pid" 2>/dev/null || return 1
-    first=$(file_mtime "$beat")
-    [ -n "$first" ] && break
-    sleep 0.1
-    i=$((i + 1))
-  done
-  while [ "$i" -lt "$limit" ]; do
-    kill -0 "$pid" 2>/dev/null || return 1
-    now=$(file_mtime "$beat")
-    if [ -n "$now" ] && [ "$now" != "$first" ]; then
-      return 0
-    fi
+    now=$(cat "$beat" 2>/dev/null || true)
+    case "$now" in ''|*[!0-9]*) now=-1 ;; esac
+    [ "$now" -ge "$(( start + 2 ))" ] && return 0
     sleep 0.1
     i=$((i + 1))
   done
@@ -116,12 +111,6 @@ wait_numeric_file() {
     i=$((i + 1))
   done
   return 1
-}
-
-# Portable mtime in epoch seconds. Platform-detected, never the `stat -f || stat -c`
-# fallback (which writes a partial filesystem dump on Linux; see fm-watch.sh).
-file_mtime() {
-  if [ "$(uname)" = Darwin ]; then stat -f %m "$1" 2>/dev/null; else stat -c %Y "$1" 2>/dev/null; fi
 }
 
 # Set <file>'s mtime to exactly <epoch> seconds, for aging a busy-turn marker by

@@ -33,7 +33,11 @@ if [ "${1:-}" = "status" ]; then
   exit 0
 fi
 
-me=$(fm_harness_ancestry_pid) || { echo "error: cannot locate harness process in ancestry" >&2; exit 1; }
+# Resolved in THIS shell rather than through $( ): the walk snapshots the
+# process table into shell variables a substitution could never publish back,
+# so reading it back would throw away work this script pays for again below.
+me=''
+fm_harness_ancestry_pid_into me || { echo "error: cannot locate harness process in ancestry" >&2; exit 1; }
 probe=$(mktemp "$STATE/.lock-write.XXXXXX" 2>/dev/null) || {
   echo "error: cannot write session lock; operate read-only until resolved" >&2
   exit 1

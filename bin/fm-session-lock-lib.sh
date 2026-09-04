@@ -100,8 +100,8 @@ fm_harness_process_matches() {  # <comm> <args>
   return 1
 }
 
-# Walk the current process ancestry (up to 16 hops) and print this session's
-# contiguous verified-harness ancestry, innermost pid first.
+# Walk the invoking shell's process ancestry (up to 16 hops) and report this
+# session's contiguous verified-harness ancestry, innermost pid first.
 #
 # The walk climbs freely until the first harness match, because the caller is
 # normally an ordinary shell several levels below its session. After that first
@@ -118,30 +118,55 @@ fm_harness_process_matches() {  # <comm> <args>
 # claude), with no non-harness process between them. Which pid in that run is the
 # session cannot be read off the ancestry at all, so the whole contiguous run is
 # reported and the callers below decide what they need from it.
-fm_harness_ancestry_pids() {
-  local pid next comm args extending=0 printed=0
-  # Every snapshot call must run in THIS shell: the per-hop reads below happen
-  # in $( ) subshells that inherit a populated table but cannot publish one
-  # back, so a snapshot taken there would be retaken on every single read.
-  # fm_ps_self_pid assigns for the same reason - through $( ) it would name a
-  # subshell that is dead before the walk reads the table.
-  fm_ps_self_pid pid || return 1
+#
+# ASSIGNS the run, newline-separated, into the variable named $1.
+#
+# Assigning is what lets a caller take the walk in its OWN shell. That is a cost
+# rule rather than a correctness one now that fm_ps_self_pid names the invoking
+# shell on both platforms: the snapshots this walk takes are ordinary shell
+# variables, so a $( ) fork inherits them but can never publish one back, and a
+# walk read through a substitution throws its snapshot away. On Windows that
+# snapshot is a PowerShell spawn, and this runs on the Claude Stop hook at every
+# turn end.
+#
+# The locals carry a __fmw_ prefix of their own, and every out-variable name
+# below is one of them. An assigning function writes through `printf -v` into
+# whatever name it was handed, so a local of that same name inside the CALLEE
+# shadows the caller's variable and swallows the value silently. The primitives
+# in fm-ps-lib.sh all use __fm_, so a walk that named its own pid __fm_pid would
+# hand fm_ps_self_pid the name of that function's own local and read back
+# nothing. Keep each layer's prefix distinct from the layer it calls.
+fm_harness_ancestry_pids_into() {  # <outvar>
+  local __fmw_out=$1 __fmw_pid __fmw_next __fmw_comm __fmw_args
+  local __fmw_extending=0 __fmw_run=''
+  # Both snapshot calls must run in THIS shell, for the reason above: taken
+  # inside one of the per-hop reads they would be retaken on every single read.
+  fm_ps_self_pid __fmw_pid || return 1
   fm_ps_cyg_ensure || true
   for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
     # One combined lookup per hop; see fm_ps_hop for why this is not three calls.
-    fm_ps_hop "$pid" comm args next || break
-    if fm_harness_process_matches "$comm" "$args"; then
-      printf '%s\n' "$pid"
-      printed=1
+    fm_ps_hop "$__fmw_pid" __fmw_comm __fmw_args __fmw_next || break
+    if fm_harness_process_matches "$__fmw_comm" "$__fmw_args"; then
+      __fmw_run="${__fmw_run:+$__fmw_run
+}$__fmw_pid"
       [ "$FM_HARNESS_IS_CLAUDE" -eq 1 ] || break
-      extending=1
-    elif [ "$extending" -eq 1 ]; then
+      __fmw_extending=1
+    elif [ "$__fmw_extending" -eq 1 ]; then
       break
     fi
-    [ -n "$next" ] && [ "$next" -gt 1 ] || break
-    pid=$next
+    [ -n "$__fmw_next" ] && [ "$__fmw_next" -gt 1 ] || break
+    __fmw_pid=$__fmw_next
   done
-  [ "$printed" -eq 1 ]
+  [ -n "$__fmw_run" ] || return 1
+  printf -v "$__fmw_out" '%s' "$__fmw_run"
+}
+
+# Print that run, for callers outside this file that want it as text. Callers in
+# this file take the assigning form above instead.
+fm_harness_ancestry_pids() {
+  local run
+  fm_harness_ancestry_pids_into run || return 1
+  printf '%s\n' "$run"
 }
 
 # Print the one pid that identifies this session when the session lock is being
@@ -150,16 +175,27 @@ fm_harness_ancestry_pids() {
 # returns, and a lock naming it would look stale moments later while the session
 # is still running. Every non-Claude harness reports a single pid, so this is its
 # innermost match unchanged.
-fm_harness_ancestry_pid() {
-  local pids pid outermost=''
-  pids=$(fm_harness_ancestry_pids) || return 1
-  while IFS= read -r pid; do
-    [ -n "$pid" ] && outermost=$pid
+#
+# ASSIGNS into the variable named $1 and takes the walk in the caller's shell,
+# so nothing this resolution costs is thrown away with a subshell.
+# Its locals carry a __fmr_ prefix for the shadowing reason given above.
+fm_harness_ancestry_pid_into() {  # <outvar>
+  local __fmr_out=$1 __fmr_run __fmr_pid __fmr_outermost=''
+  fm_harness_ancestry_pids_into __fmr_run || return 1
+  while IFS= read -r __fmr_pid; do
+    [ -n "$__fmr_pid" ] && __fmr_outermost=$__fmr_pid
   done <<EOF
-$pids
+$__fmr_run
 EOF
-  [ -n "$outermost" ] || return 1
-  printf '%s\n' "$outermost"
+  [ -n "$__fmr_outermost" ] || return 1
+  printf -v "$__fmr_out" '%s' "$__fmr_outermost"
+}
+
+# Print that pid, for callers outside this file that want it as text.
+fm_harness_ancestry_pid() {
+  local pid
+  fm_harness_ancestry_pid_into pid || return 1
+  printf '%s\n' "$pid"
 }
 
 # True if $1 is a live process that looks like a verified harness.
@@ -188,7 +224,7 @@ fm_session_lock_owned_by_self() {
   case "$lock_pid" in
     ''|*[!0-9]*) return 1 ;;
   esac
-  pids=$(fm_harness_ancestry_pids) || return 1
+  fm_harness_ancestry_pids_into pids || return 1
   while IFS= read -r pid; do
     [ "$pid" = "$lock_pid" ] && return 0
   done <<EOF

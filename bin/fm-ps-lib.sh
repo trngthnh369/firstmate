@@ -179,17 +179,28 @@ fm_ps_cyg_pid() {  # <winpid>
 
 # Resolve the pid the ancestry walk should START from into variable named $1.
 #
-# ASSIGNS rather than prints, and that is the whole point on Windows: read
-# through $( ) this would name the substitution's own short-lived subshell.
-# Assigned in the caller's shell it names a process that stays alive for the
-# walk, which is what makes /proc/self/winpid safe to use here.
+# ASSIGNS rather than prints, so a caller never has to read the value back
+# through $( ) and it lands in a shell that stays alive for the whole walk.
+#
+# BOTH branches name the INVOKING SHELL, never whichever process happens to be
+# executing this function, and they have to agree or the walk is correct on only
+# one platform. `$$` is that shell by definition: the shell fixes it at startup
+# and every subshell, command substitution included, inherits it unchanged.
+# `/proc/self` does not follow that rule - it is whatever process reads it - so
+# through a $( ) fork it named the fork instead. Under MSYS a fork is a whole
+# new Windows process, absent from any snapshot taken before it existed, so a
+# walk seeded there asked the process table for a pid it had never heard of and
+# broke on its first hop. Reading `$$`'s winpid is what keeps the two branches
+# saying the same thing.
 #
 # The locals are __fm_-prefixed because a local named after the caller's own
 # variable would shadow the very variable this assigns to.
 fm_ps_self_pid() {  # <outvar>
   local __fm_out=$1 __fm_pid=''
   if [ "$FM_PS_WINDOWS" -eq 1 ]; then
-    read -r __fm_pid < /proc/self/winpid 2>/dev/null || return 1
+    # No trailing newline in this /proc entry, so read's exit status lies; only
+    # the assigned value is evidence, exactly as in fm_ps_comm.
+    read -r __fm_pid < "/proc/$$/winpid" 2>/dev/null || :
   else
     __fm_pid=$$
   fi

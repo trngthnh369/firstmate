@@ -25,6 +25,9 @@ fm_is_gate_agent "$FM_ROOT" && exit 0
 fm_primary_scope_matches "$FM_ROOT" "$STATE" || exit 0
 
 lock_is_in_ancestry() {
+  # comm and args are required out-variables of fm_ps_hop; this walk compares
+  # pids only and never reads either one.
+  # shellcheck disable=SC2034
   local lock_pid pid next comm args _
   [ -f "$STATE/.lock" ] || return 1
   IFS= read -r lock_pid < "$STATE/.lock" 2>/dev/null || return 1

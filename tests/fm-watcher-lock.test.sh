@@ -1102,6 +1102,184 @@ test_msys_pid_identity_uses_proc() {
   pass "MSYS process identity uses compatible /proc fields"
 }
 
+
+# --- Liveness-beacon cadence -------------------------------------------------
+# fm-guard.sh, fm-watch-arm.sh and the auto-arm ladder all decide "a supervision
+# cycle is alive" from state/.last-watcher-beat's age. A poll iteration is not
+# instantaneous - the per-window sweep alone spends a pane capture and a
+# crew-state read per task - so a beacon written only at iteration boundaries
+# reports a perfectly healthy cycle as stale for most of its life. These cases
+# drive a deliberately slow REAL iteration and assert what the beacon says at
+# points INSIDE it, which is the only thing an aged mtime cannot fake: the fake
+# tmux records the beacon each pane capture observes (see make_case's
+# FM_FAKE_TMUX_CAPTURE_PROBE_LOG), so one record per window per poll arrives in
+# sweep order.
+BEAT_PROBE_WINDOWS=$(printf 'fm-alpha\nfm-bravo\nfm-charlie')
+
+# Stand up a three-task home whose pane captures are slow enough for
+# whole-second mtimes to tell the sweep's steps apart, and echo the case dir.
+make_beat_probe_case() {  # <name> <capture-sleep-seconds>
+  local name=$1 sleep_secs=$2 dir state
+  dir=$(make_case "$name")
+  state="$dir/state"
+  printf 'static pane\n' > "$dir/pane.txt"
+  : > "$dir/probe.log"
+  printf 'window=%s\nkind=ship\nharness=pi\n' 'test:fm-alpha' > "$state/alpha.meta"
+  printf 'window=%s\nkind=ship\nharness=pi\n' 'test:fm-bravo' > "$state/bravo.meta"
+  printf 'window=%s\nkind=ship\nharness=pi\n' 'test:fm-charlie' > "$state/charlie.meta"
+  printf '%s\n' "$sleep_secs" > "$dir/capture-sleep"
+  printf '%s\n' "$dir"
+}
+
+# Start the watcher over that home. Panes report an authoritatively working crew
+# so a stale hash is absorbed rather than surfaced: a wake would exit the cycle
+# at an iteration boundary and leave the case asserting nothing about the middle
+# of one.
+# Publishes the watcher pid in BEAT_PROBE_PID rather than echoing it: a command
+# substitution would background the watcher inside a subshell, and wait_for_exit
+# can only reap a direct child of the test shell.
+BEAT_PROBE_PID=
+start_beat_probe_watcher() {  # <dir> -> sets BEAT_PROBE_PID
+  local dir=$1 state="$1/state"
+  PATH="$dir/fakebin:$PATH" \
+    FM_FAKE_TMUX_WINDOWS="$BEAT_PROBE_WINDOWS" \
+    FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_FAKE_TMUX_CAPTURE_PROBE_LOG="$dir/probe.log" \
+    FM_FAKE_TMUX_BEAT="$state/.last-watcher-beat" \
+    FM_FAKE_TMUX_CAPTURE_SLEEP="$(cat "$dir/capture-sleep")" \
+    FM_FAKE_CREW_STATE='state: working · source: run-step · running' \
+    FM_HOME="$dir" FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$dir/fakebin/fm-crew-state.sh" \
+    FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
+    "$ROOT/bin/fm-watch.sh" > "$dir/watch.out" &
+  BEAT_PROBE_PID=$!
+}
+
+# One poll's window sweep costs a subprocess per window on top of the pane
+# capture, and Git Bash pays a far higher fork cost than CI, so the budget here
+# is a ceiling a passing case never spends rather than an expected duration.
+BEAT_PROBE_TICKS=1800
+
+wait_beat_probe_records() {  # <dir> <count> <pid>
+  local dir=$1 want=$2 pid=$3 i=0 have
+  while [ "$i" -lt "$BEAT_PROBE_TICKS" ]; do
+    have=$(awk 'END {print NR}' "$dir/probe.log" 2>/dev/null)
+    case "$have" in ''|*[!0-9]*) have=0 ;; esac
+    [ "$have" -ge "$want" ] && return 0
+    is_live_non_zombie "$pid" || return 1
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+beat_probe_field() {  # <dir> <record> <field: 1 window, 2 cycle, 3 beacon mtime>
+  sed -n "$2p" "$1/probe.log" | cut -f"$3"
+}
+
+# Three windows swept back to back inside ONE poll iteration. Each capture
+# reports the beacon as it stood at that step, so a beacon written once per
+# iteration shows all three the same mtime, and a beacon that tracks progress
+# advances between them.
+test_beacon_advances_between_steps_of_one_poll_iteration() {
+  local dir pid distinct w1 w2 w3 c1 c2 c3 m1 m2 m3
+  dir=$(make_beat_probe_case beat-cadence 2)
+  start_beat_probe_watcher "$dir"
+  pid=$BEAT_PROBE_PID
+  wait_beat_probe_records "$dir" 3 "$pid" || {
+    kill -TERM "$pid" 2>/dev/null || true
+    wait_for_exit "$pid" 80
+    fail "the window sweep did not complete one poll iteration (probe: $(cat "$dir/probe.log"), watcher: $(cat "$dir/watch.out"))"
+  }
+  kill -TERM "$pid" 2>/dev/null || true
+  wait_for_exit "$pid" 80
+
+  w1=$(beat_probe_field "$dir" 1 1); c1=$(beat_probe_field "$dir" 1 2); m1=$(beat_probe_field "$dir" 1 3)
+  w2=$(beat_probe_field "$dir" 2 1); c2=$(beat_probe_field "$dir" 2 2); m2=$(beat_probe_field "$dir" 2 3)
+  w3=$(beat_probe_field "$dir" 3 1); c3=$(beat_probe_field "$dir" 3 2); m3=$(beat_probe_field "$dir" 3 3)
+  [ "$w1" = test:fm-alpha ] && [ "$w2" = test:fm-bravo ] && [ "$w3" = test:fm-charlie ] \
+    || fail "the sweep did not visit the three windows once each in order ($w1 $w2 $w3)"
+  case "$m1$m2$m3" in
+    *none*) fail "a pane capture found no beacon at all ($m1 $m2 $m3)" ;;
+  esac
+  [ "$m2" -gt "$m1" ] && [ "$m3" -gt "$m2" ] \
+    || fail "the beacon did not advance during one poll iteration (mtimes $m1 $m2 $m3)"
+  distinct=$(printf '%s\n%s\n%s\n' "$m1" "$m2" "$m3" | sort -u | awk 'END {print NR}')
+  [ "$distinct" -eq 3 ] || fail "expected three separate beats inside one iteration, got $distinct"
+  case "$c1" in
+    ''|none|*[!0-9]*) fail "the beacon carried no poll-iteration number ('$c1')" ;;
+  esac
+  [ "$c1" = "$c2" ] && [ "$c2" = "$c3" ] \
+    || fail "the three captures did not fall in one poll iteration (iterations $c1 $c2 $c3)"
+  pass "the beacon advances between the steps of a single slow poll iteration"
+}
+
+# The beat belongs to the cycle holding the singleton lock. Hand the lock to a
+# live foreign pid while the sweep is inside its first window, exactly as a
+# takeover would: the rest of that same iteration must stop beating, or an
+# evicted duplicate would keep the beacon fresh for a home it no longer
+# supervises, and the survivor's staleness signal would be masked by its ghost.
+test_beat_stops_when_the_lock_no_longer_names_this_cycle() {
+  local dir pid lock_pid m1 m2 m3
+  dir=$(make_beat_probe_case beat-evicted 2)
+  start_beat_probe_watcher "$dir"
+  pid=$BEAT_PROBE_PID
+  wait_beat_probe_records "$dir" 1 "$pid" \
+    || fail "the sweep never reached its first window: $(cat "$dir/watch.out")"
+  printf '%s\n' "$$" > "$dir/state/.watch.lock/pid"
+  wait_beat_probe_records "$dir" 3 "$pid" || {
+    kill -TERM "$pid" 2>/dev/null || true
+    wait_for_exit "$pid" 80
+    fail "the evicted cycle did not finish its sweep (probe: $(cat "$dir/probe.log"))"
+  }
+  wait_for_exit "$pid" 600 || {
+    kill -TERM "$pid" 2>/dev/null || true
+    fail "the watcher did not self-evict after the lock was taken over mid-iteration"
+  }
+  m1=$(beat_probe_field "$dir" 1 3)
+  m2=$(beat_probe_field "$dir" 2 3)
+  m3=$(beat_probe_field "$dir" 3 3)
+  [ "$m2" = "$m1" ] && [ "$m3" = "$m1" ] \
+    || fail "a cycle that lost the lock kept beating the beacon (mtimes $m1 $m2 $m3)"
+  lock_pid=$(cat "$dir/state/.watch.lock/pid" 2>/dev/null || true)
+  [ "$lock_pid" = "$$" ] || fail "the evicted watcher clobbered the new holder's lock (got '$lock_pid')"
+  pass "a cycle that loses the singleton lock mid-iteration stops beating"
+}
+
+# Beating more often must not buy liveness for a cycle that is not running. A
+# frozen watcher is still a live pid, so the beat itself is the only thing that
+# separates it from a working one - freeze it right after a beat and the beacon
+# must go stale on the ordinary grace.
+test_stopped_cycle_beacon_freezes_and_reads_stale() {
+  local dir pid m0 m1
+  dir=$(make_beat_probe_case beat-frozen 1)
+  start_beat_probe_watcher "$dir"
+  pid=$BEAT_PROBE_PID
+  wait_beat_probe_records "$dir" 1 "$pid" \
+    || fail "the sweep never reached its first window: $(cat "$dir/watch.out")"
+  # Pin the divergence before freezing anything. fm_watcher_healthy rejects an
+  # identity or lock mismatch just as readily as a stale beacon, so without this
+  # the rejection below would prove nothing about the beat: assert the running
+  # cycle IS healthy first, and only staleness can explain the later refusal.
+  FM_HOME="$dir" FM_STATE_OVERRIDE="$dir/state" \
+    bash -c '. "$1"; fm_watcher_healthy "$2" "$3" 300 "$4"' _ "$LIB" "$dir/state" "$WATCH" "$dir" \
+    || fail "the running cycle was not classified healthy, so the staleness assertion below would be vacuous"
+  kill -STOP "$pid" 2>/dev/null || fail "could not freeze the watcher cycle"
+  m0=$(file_mtime "$dir/state/.last-watcher-beat")
+  sleep 4
+  m1=$(file_mtime "$dir/state/.last-watcher-beat")
+  [ "$m1" = "$m0" ] || fail "a frozen cycle kept beating the beacon ($m0 -> $m1)"
+  FM_STATE_OVERRIDE="$dir/state" bash -c '. "$1"; fm_pid_alive "$2"' _ "$LIB" "$pid" \
+    || fail "the frozen watcher was not classified as a live pid"
+  if FM_HOME="$dir" FM_STATE_OVERRIDE="$dir/state" \
+    bash -c '. "$1"; fm_watcher_healthy "$2" "$3" 2 "$4"' _ "$LIB" "$dir/state" "$WATCH" "$dir"; then
+    fail "a frozen cycle whose beacon stopped advancing was still classified healthy"
+  fi
+  kill -CONT "$pid" 2>/dev/null || true
+  kill -TERM "$pid" 2>/dev/null || true
+  wait_for_exit "$pid" 80
+  pass "a cycle that stops running stops beating and goes stale within the grace"
+}
+
 test_singleton_start
 test_pid_identity_is_locale_invariant
 test_proc_pid_identity_ignores_wall_clock_and_detects_pid_reuse
@@ -1131,3 +1309,6 @@ test_arm_waits_for_peer_beacon_after_child_stands_down
 test_arm_fails_loud_when_no_fresh_watcher_confirmable
 test_cycle_exit_ledger_links_successor_and_stays_bounded
 test_stopped_watcher_is_live_but_stale_then_exit_is_classified
+test_beacon_advances_between_steps_of_one_poll_iteration
+test_beat_stops_when_the_lock_no_longer_names_this_cycle
+test_stopped_cycle_beacon_freezes_and_reads_stale

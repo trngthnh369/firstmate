@@ -99,6 +99,8 @@ The file is size-capped through `FM_WATCH_CYCLE_LOG_MAX_BYTES` and `FM_WATCH_CYC
 
 The default 300-second grace is unchanged.
 Only the watcher process touches `state/.last-watcher-beat`; no helper process can make a wedged watcher appear healthy.
+That process beats at every point its poll cycle demonstrably moves forward rather than only at iteration boundaries, so the beacon's age measures how long the cycle has been unresponsive rather than how long its current iteration has been running.
+A cycle that has lost the singleton lock stops beating immediately, and the beacon's content is the number of the poll iteration currently running, which lets an observer separate a mid-iteration beat from a new iteration while only the mtime decides liveness.
 
 ## Regression coverage
 

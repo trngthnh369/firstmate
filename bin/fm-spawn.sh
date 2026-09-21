@@ -1577,7 +1577,7 @@ if [ "$RELAUNCH" -eq 1 ]; then
     exit 1
   }
   SPAWN_META_LOCK=$(fm_meta_lock_path "$RELAUNCH_META") || exit 1
-  fm_lock_acquire_wait "$SPAWN_META_LOCK"
+  fm_lock_acquire_wait_or_die "$SPAWN_META_LOCK"
   SPAWN_META_LOCK_HELD=1
   fm_backlog_record_present "$RELAUNCH_META" "task record" "$STATE" || {
     echo "error: --relaunch refused after locking: $FM_BACKLOG_TRANSITION_ERROR" >&2
@@ -3134,7 +3134,7 @@ fi
 
 if [ "$SPAWN_META_LOCK_HELD" != 1 ]; then
   SPAWN_META_LOCK=$(fm_meta_lock_path "$STATE/$ID.meta") || exit 1
-  fm_lock_acquire_wait "$SPAWN_META_LOCK"
+  fm_lock_acquire_wait_or_die "$SPAWN_META_LOCK"
   SPAWN_META_LOCK_HELD=1
 fi
 if [ -e "$STATE/$ID.backlog-close" ] || [ -L "$STATE/$ID.backlog-close" ]; then
@@ -3493,7 +3493,27 @@ spawn_current_path() { # <target>
   cmux) fm_backend_cmux_current_path "$1" "$W" ;;
   esac
 }
-spawn_send_literal() { # <target> <text>
+# spawn_discover_path: the worktree-DISCOVERY reader. Passive first, exactly as
+# before; only when the backend's passive channel yields nothing does it fall
+# back to an ACTIVE probe that types into the pane.
+#
+# Kept separate from spawn_current_path on purpose. spawn_current_path is also
+# the relaunch reader, and relaunch adopts an EXISTING endpoint whose pane may
+# hold a live agent - an active probe there would submit text into that agent's
+# composer. Only this function, called only from the treehouse-get wait below
+# (where the pane is a shell prompt firstmate itself just opened), may probe.
+spawn_discover_path() {  # <target>
+  local p
+  p=$(spawn_current_path "$1" || true)
+  if [ -n "$p" ]; then
+    printf '%s' "$p"
+    return 0
+  fi
+  case "$BACKEND" in
+    herdr) fm_backend_herdr_probe_path "$1" ;;
+  esac
+}
+spawn_send_literal() {  # <target> <text>
   case "$BACKEND" in
   tmux) fm_backend_tmux_send_literal "$1" "$2" ;;
   herdr) fm_backend_herdr_send_literal "$1" "$2" ;;
@@ -3878,7 +3898,7 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   last_seen=""
   last_reason="the pane reported no path"
   for _ in $(seq 1 60); do
-    p=$(spawn_current_path "$WT_TARGET" || true)
+    p=$(spawn_discover_path "$WT_TARGET" || true)
     [ -z "$p" ] || last_seen="$p"
     if [ -n "$p" ] && spawn_worktree_isolated "$p"; then
       p_real=$(real_path_or_raw "$p")
@@ -4439,7 +4459,7 @@ SPAWN_GEN="s$(date +%s).${BASHPID:-$$}.$RANDOM"
 SPAWN_META_PATH="$STATE/$ID.meta"
 if [ "$SPAWN_META_LOCK_HELD" != 1 ]; then
   SPAWN_META_LOCK=$(fm_meta_lock_path "$STATE/$ID.meta") || exit 1
-  fm_lock_acquire_wait "$SPAWN_META_LOCK"
+  fm_lock_acquire_wait_or_die "$SPAWN_META_LOCK"
   SPAWN_META_LOCK_HELD=1
 fi
 if [ "$RELAUNCH" -eq 1 ]; then
@@ -4697,7 +4717,7 @@ spawn_record_traceparent() {
   # independent critical section so other metadata interfaces can serialize.
   if [ "$SPAWN_META_LOCK_HELD" != 1 ]; then
     SPAWN_META_LOCK=$(fm_meta_lock_path "$meta") || return 1
-    fm_lock_acquire_wait "$SPAWN_META_LOCK"
+    fm_lock_acquire_wait_or_die "$SPAWN_META_LOCK"
     SPAWN_META_LOCK_HELD=1
     acquired=1
   fi
@@ -4916,7 +4936,7 @@ fi
 # per-task lock as metadata publication, then and only then report success.
 if [ "$SPAWN_META_LOCK_HELD" != 1 ]; then
   SPAWN_META_LOCK=$(fm_meta_lock_path "$STATE/$ID.meta") || exit 1
-  fm_lock_acquire_wait "$SPAWN_META_LOCK"
+  fm_lock_acquire_wait_or_die "$SPAWN_META_LOCK"
   SPAWN_META_LOCK_HELD=1
 fi
 SPAWN_DEFERRED_SIGNAL=

@@ -55,6 +55,45 @@ if [ "${1:-}" = "status" ]; then
   exit 0
 fi
 
+if [ "${1:-}" = "steal-sweep" ]; then
+  # Report, and with --apply remove, the abandoned ".steal" artifacts an
+  # unconverging steal recursion left behind in this home's state directory.
+  # Staleness is fm_lock_steal_is_stale's judgement, so an unreadable pid, a
+  # live owner, or an unreadable mtime all keep the artifact untouched.
+  # shellcheck source=bin/fm-wake-lib.sh
+  . "$SCRIPT_DIR/fm-wake-lib.sh"
+  apply=0
+  [ "${2:-}" = "--apply" ] && apply=1
+  found=0
+  removed=0
+  for artifact in "$STATE"/*.steal "$STATE"/.*.steal; do
+    [ -e "$artifact" ] || [ -L "$artifact" ] || continue
+    found=$((found + 1))
+    if ! fm_lock_steal_is_stale "$artifact"; then
+      echo "kept (not provably abandoned): $artifact"
+      continue
+    fi
+    if [ "$apply" -eq 0 ]; then
+      echo "would remove: $artifact"
+      continue
+    fi
+    if fm_lock_remove_path "$artifact"; then
+      echo "removed: $artifact"
+      removed=$((removed + 1))
+    else
+      echo "could not remove: $artifact" >&2
+    fi
+  done
+  if [ "$found" -eq 0 ]; then
+    echo "no .steal artifacts in $STATE"
+  elif [ "$apply" -eq 0 ]; then
+    echo "dry run; re-run with: $(basename "$0") steal-sweep --apply"
+  else
+    echo "removed $removed of $found"
+  fi
+  exit 0
+fi
+
 me=$(fm_session_lock_anchor_pid) || { echo "error: cannot locate harness process in ancestry" >&2; exit 1; }
 probe=$(mktemp "$STATE/.lock-write.XXXXXX" 2>/dev/null) || {
   echo "error: cannot write session lock; operate read-only until resolved" >&2
@@ -161,7 +200,7 @@ publish_lock_session_or_die() {
 confirm_own_lock() {  # <recorded-pid>
   local recorded waited=0
   if [ "$CLAIM_LOCK_HELD" -ne 1 ]; then
-    fm_lock_acquire_wait "$CLAIM_LOCK"
+    fm_lock_acquire_wait_or_die "$CLAIM_LOCK"
     CLAIM_LOCK_HELD=1
     waited=1
   fi
@@ -206,7 +245,7 @@ if ! fm_lock_try_acquire "$CLAIM_LOCK"; then
     echo "error: the prior session's bounded startup sweep is finishing; operate read-only until it releases the fleet lock" >&2
     exit 1
   fi
-  fm_lock_acquire_wait "$CLAIM_LOCK"
+  fm_lock_acquire_wait_or_die "$CLAIM_LOCK"
 fi
 CLAIM_LOCK_HELD=1
 

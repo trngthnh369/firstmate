@@ -1763,7 +1763,7 @@ procevent_surface_queued() {
   local key reason captured="" stranded="" unstarted=""
   PROCEVENT_SURFACED=
   [ -s "$FM_WAKE_QUEUE" ] || return 0
-  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
+  fm_lock_acquire_wait_or_die "$FM_WAKE_QUEUE_LOCK"
   while IFS= read -r key; do
     case "$key" in procevent:*) ;; *) continue ;; esac
     [ -e "$(procevent_surfaced_marker "$key")" ] && continue

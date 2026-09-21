@@ -273,6 +273,57 @@ SH
   pass "session-lock: a live version-named session holding the lock is not mistaken for a stale owner"
 }
 
+# The resolver is asked the same question twice by real callers - the Stop
+# auto-arm checks ownership, decides the owner is stale, then checks again after
+# reclaiming - so the second answer must not depend on the first having run.
+# It did: the walk snapshots the process table into ordinary shell variables, a
+# $( ) fork inherits that snapshot but is itself a process the snapshot predates,
+# and on a platform where a fork is a new OS process the walk then asked the
+# table about a pid it could not contain and broke on its first hop.
+test_resolution_is_indifferent_to_a_warmed_process_table() {
+  local dir fakebin got
+  dir="$TMP_ROOT/warmed-table"
+  fakebin=$(fm_fakebin "$dir")
+  mkdir -p "$dir/state"
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+set -u
+field= pid=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o) field=$2; shift 2 ;;
+    -p) pid=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+case "$pid:$field" in
+  800:comm=) printf '%s\n' codex ;;
+  800:args=) printf '%s\n' codex ;;
+  800:ppid=) printf '%s\n' 1 ;;
+  *:comm=) printf '%s\n' bash ;;
+  *:args=) printf '%s\n' bash ;;
+  *:ppid=) printf '%s\n' 800 ;;
+esac
+SH
+  chmod +x "$fakebin/ps"
+  printf '800\n' > "$dir/state/.lock"
+
+  got=$(lib_eval "$fakebin" 'p=; fm_harness_ancestry_pid_into p; printf "%s" "$p"')
+  [ "$got" = 800 ] || fail "a cold resolution named '$got' instead of the session pid 800"
+
+  got=$(lib_eval "$fakebin"     'w=; fm_harness_ancestry_pids_into w; p=; fm_harness_ancestry_pid_into p; printf "%s" "$p"')
+  [ "$got" = 800 ] || fail "a resolution after the process table was already read named '$got', not 800"
+
+  got=$(lib_eval "$fakebin" 'w=; fm_harness_ancestry_pids_into w; fm_harness_ancestry_pid')
+  [ "$got" = 800 ] || fail "the printing resolver named '$got' after the process table was already read, not 800"
+
+  # The exact order the Stop auto-arm uses: an ownership test, then a liveness
+  # test that reads the table, then the ownership test again.
+  lib_eval "$fakebin"     "fm_session_lock_owned_by_self '$dir/state'; fm_harness_pid_alive 800 >/dev/null; fm_session_lock_owned_by_self '$dir/state'"     || fail "the session stopped recognizing its own lock once the process table had been read"
+
+  pass "session-lock: resolution and ownership do not depend on whether the process table was already read"
+}
+
 # A background Claude session's process table. The hook fires inside
 # `claude bg-spare` (710), whose parent is `claude bg-pty-host` (720). With the
 # transient daemon gone the pty-host is reparented to launchd, so the contiguous
@@ -565,6 +616,69 @@ test_e2e_daemon_parented_version_named_session_keeps_its_lock() {
   expect_code 2 "$(hook_rc "$dir")" "a version-named session under a daemon must claim its home and rewake"
   [ -e "$dir/state/arm-ran" ] || fail "supervision never armed for a version-named daemon-parented session"
   pass "session-lock e2e: a version-named session under a harness-named daemon keeps its own lock"
+}
+
+# A real claude-named session whose probe runs from an ordinary child shell,
+# exactly where a hook runs, so the walk has to climb into the session rather
+# than start on it.
+make_probe_home() {  # <dir>
+  local dir=$1
+  mkdir -p "$dir/state" "$dir/bin"
+  cp "$ROOT/bin/fm-session-lock-lib.sh" "$dir/bin/fm-session-lock-lib.sh"
+  cp "$ROOT/bin/fm-cursor-lib.sh" "$dir/bin/fm-cursor-lib.sh"
+  cp "$ROOT/bin/fm-ps-lib.sh" "$dir/bin/fm-ps-lib.sh"
+  cat > "$dir/probe.sh" <<'SH'
+#!/usr/bin/env bash
+set -u
+. "$FM_HOME/bin/fm-session-lock-lib.sh"
+cold=none
+fm_harness_ancestry_pid_into cold || cold=none
+seed=
+fm_harness_ancestry_pids_into seed || :
+warm=none
+fm_harness_ancestry_pid_into warm || warm=none
+subst=$(fm_harness_ancestry_pid 2>/dev/null) || subst=none
+printf '%s %s %s %s\n' "$cold" "$warm" "$subst" "$FM_SESSION_PID" > "$FM_HOME/state/probe.out"
+SH
+  cat > "$dir/session.sh" <<'SH'
+#!/usr/bin/env bash
+i=0
+while [ "$i" -lt 200 ] && [ "$(ps -o ppid= -p $$ 2>/dev/null | tr -d ' ')" != 1 ]; do
+  sleep 0.05
+  i=$((i + 1))
+done
+FM_SESSION_PID=$$ bash "$FM_HOME/probe.sh"
+SH
+  chmod +x "$dir/session.sh" "$dir/probe.sh"
+}
+
+run_probe_tree() {  # <dir> <session-bin>
+  local dir=$1 session_bin=$2 i
+  FM_HOME="$dir" bash -c '"$0" "$1" &' "$session_bin" "$dir/session.sh"
+  i=0
+  while [ "$i" -lt 400 ] && [ ! -s "$dir/state/probe.out" ]; do
+    sleep 0.05
+    i=$((i + 1))
+  done
+  [ -s "$dir/state/probe.out" ] || fail "the probe never finished"
+}
+
+# The same invariant as the unit case, against the host's REAL process table
+# rather than a fixture one, because the defect this pins lives in how a given
+# platform answers "which process am I" for a walk that has already snapshotted.
+# The tree is a real orphaned harness ancestry, so the case can never go vacuous
+# by resolving nothing at all on either side of the comparison.
+test_e2e_resolution_survives_a_warmed_process_table() {
+  local dir cold warm subst session_pid
+  dir="$TMP_ROOT/e2e-warmed-table"
+  make_probe_home "$dir"
+  run_probe_tree "$dir" "$NAMED_CLAUDE"
+  read -r cold warm subst session_pid < "$dir/state/probe.out"
+  [ "$cold" != none ]     || fail "the probe resolved no harness at all, so this case proves nothing about a warmed table"
+  [ "$cold" = "$session_pid" ]     || fail "a cold resolution named '$cold' instead of the real session pid $session_pid"
+  [ "$warm" = "$cold" ]     || fail "reading the process table first changed the answer: cold '$cold', warmed '$warm'"
+  [ "$subst" = "$cold" ]     || fail "reading the resolver through a command substitution changed the answer: '$subst' against '$cold'"
+  pass "session-lock e2e: a real session resolves the same pid whether or not the process table was already read"
 }
 
 # --- end-to-end layer: a background session whose helper chain is recycled ---
@@ -1098,9 +1212,11 @@ test_harness_beyond_a_gap_never_owns_the_lock
 test_competing_version_named_session_is_seen_as_live
 test_same_session_id_owns_a_recycled_background_chain
 test_anchor_pid_is_the_model_loop_process_only_for_a_trusted_id
+test_resolution_is_indifferent_to_a_warmed_process_table
 test_e2e_version_named_session_claims_the_home
 test_e2e_daemon_parented_session_claims_the_home
 test_e2e_daemon_parented_version_named_session_keeps_its_lock
+test_e2e_resolution_survives_a_warmed_process_table
 test_e2e_background_session_keeps_its_lock_across_a_recycled_chain
 test_same_session_confirmation_refreshes_rekeyed_id_under_claim_lock
 test_same_session_confirmation_does_not_steal_after_wait

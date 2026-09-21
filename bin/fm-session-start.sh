@@ -648,7 +648,10 @@ if [ "$LOCK_RC" -ne 0 ]; then
     printf '%s\n' "$BAR"
   }
 fi
-REBUILDING_SESSION_PID=$(fm_harness_ancestry_pid 2>/dev/null || true)
+# Resolved in THIS shell rather than through $( ): the walk snapshots the
+# process table into shell variables a substitution could never publish back.
+REBUILDING_SESSION_PID=''
+fm_harness_ancestry_pid_into REBUILDING_SESSION_PID 2>/dev/null || REBUILDING_SESSION_PID=''
 print_agents_refresh_if_required "$REBUILDING_SESSION_PID"
 
 if [ "$READ_ONLY" -eq 0 ]; then

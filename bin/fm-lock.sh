@@ -33,7 +33,6 @@ if [ "${1:-}" = "status" ]; then
   exit 0
 fi
 
-
 if [ "${1:-}" = "steal-sweep" ]; then
   # Report, and with --apply remove, the abandoned ".steal" artifacts an
   # unconverging steal recursion left behind in this home's state directory.
@@ -72,7 +71,6 @@ if [ "${1:-}" = "steal-sweep" ]; then
   fi
   exit 0
 fi
-
 
 # Resolved in THIS shell rather than through $( ): the walk snapshots the
 # process table into shell variables a substitution could never publish back,

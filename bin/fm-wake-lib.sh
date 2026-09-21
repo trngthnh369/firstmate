@@ -9,6 +9,27 @@ STATE="${FM_STATE_OVERRIDE:-${STATE:-$FM_HOME/state}}"
 FM_WAKE_QUEUE="${FM_WAKE_QUEUE:-$STATE/.wake-queue}"
 FM_WAKE_QUEUE_LOCK="${FM_WAKE_QUEUE_LOCK:-$STATE/.wake-queue.lock}"
 FM_LOCK_STALE_AFTER="${FM_LOCK_STALE_AFTER:-2}"
+# Ceiling in seconds for the blocking acquire, 0 meaning unbounded for a caller
+# already under an outer deadline. An unbounded spin in a helper every
+# supervision path calls is how one unpublishable lock directory silenced a
+# whole home for two days.
+#
+# The default is deliberately generous rather than tight. What this bound exists
+# to convert is "forever" into "reported", and a host where spawning one process
+# costs tens of milliseconds makes ordinary contention slow rather than wedged:
+# ten contenders over a lock held 0.15s were measured waiting up to 85s on such
+# a host, so a tight ceiling would refuse legitimate waits.
+# docs/verification/supervision.md carries the measurement.
+FM_LOCK_ACQUIRE_WAIT_MAX="${FM_LOCK_ACQUIRE_WAIT_MAX:-300}"
+# Legitimate steal recovery nests exactly one level. Anything deeper is the
+# signature of a steal directory nobody can clean, which grows one ".steal"
+# suffix per attempt instead of converging.
+FM_LOCK_STEAL_MAX_DEPTH="${FM_LOCK_STEAL_MAX_DEPTH:-1}"
+FM_LOCK_STEAL_DEPTH="${FM_LOCK_STEAL_DEPTH:-0}"
+# Probed once per process: unknown until the first lock, then native or
+# degraded. Set it to degraded directly to force the bare-directory protocol.
+FM_LOCK_SYMLINK_MODE="${FM_LOCK_SYMLINK_MODE:-unknown}"
+FM_LOCK_WAIT_FAIL_REASON=
 # Resolved once at source time: fm_pid_identity and fm_path_mtime run inside 0.2s
 # confirm and 0.5s attach polls, and forking uname per call is a measurable cost on
 # the platform (Git Bash/MSYS) that already pays the highest fork price.
@@ -22,6 +43,14 @@ _fm_wake_require_classify() {
   command -v status_observed_signature >/dev/null 2>&1 && return 0
   # shellcheck source=bin/fm-classify-lib.sh
   . "$FM_WAKE_LIB_DIR/fm-classify-lib.sh"
+}
+
+# Load the bounded-execution owner only for callers that use the presentation
+# lock deadline. Most wake-library consumers need no timeout machinery.
+_fm_wake_require_timeout() {
+  command -v fm_run_timed >/dev/null 2>&1 && return 0
+  # shellcheck source=bin/fm-timeout-lib.sh
+  . "$FM_WAKE_LIB_DIR/fm-timeout-lib.sh"
 }
 
 fm_current_pid() {
@@ -235,6 +264,35 @@ fm_pi_extension_owns_supervision() {
   fm_pid_alive "$session_pid"
 }
 
+# Away-mode supervision evidence. While state/.afk exists the away-mode daemon
+# (bin/fm-supervise-daemon.sh) owns supervision: it runs bin/fm-watch.sh
+# one-shot, so the watcher exits on EVERY wake and the daemon starts its
+# replacement. Between those cycles no watcher process holds the watch lock,
+# with nothing at all wrong - the supervisor is the daemon, and the watcher is
+# its restarting child.
+#
+# fm_afk_daemon_owns_supervision <state>
+# True when away mode is active AND a live, identity-matched daemon holds this
+# home's singleton daemon lock. The identity match is the same discipline the
+# watcher lock uses (fm_watcher_lock_matches_pid): a recycled pid, a lock left
+# by a killed daemon, or a daemon that never recorded its identity all fail it,
+# so only a daemon process that is genuinely still running counts as ownership.
+# This proves an OWNER, never freshness: callers keep their own beacon test, so
+# a daemon that stops restarting its watcher still fails supervision once the
+# beacon passes grace.
+fm_afk_daemon_owns_supervision() {
+  local state=$1 lockdir pid recorded current
+  [ -e "$state/.afk" ] || return 1
+  lockdir="$state/.supervise-daemon.lock"
+  pid=$(cat "$lockdir/pid" 2>/dev/null) || return 1
+  fm_pid_alive "$pid" || return 1
+  recorded=$(cat "$lockdir/pid-identity" 2>/dev/null) || return 1
+  [ -n "$recorded" ] || return 1
+  current=$(fm_pid_identity "$pid" 2>/dev/null) || return 1
+  [ -n "$current" ] || return 1
+  [ "$current" = "$recorded" ]
+}
+
 # fm_watcher_supervision_verdict <state> <watch-path> [grace] [home] [root]
 # Model-aware "is supervision healthy right now" verdict for the pull warning
 # guard (bin/fm-guard.sh), NOT the arm layer or the turn-end guard. Sets:
@@ -376,13 +434,110 @@ fm_lock_remove_stray_owner_link() {
   fi
 }
 
+# Prove, once per process and on a throwaway path, whether this host publishes
+# real symlinks. Detecting it from an attempt at the lock path itself is not
+# safe under concurrency: a second racer's copy lands INSIDE the first one, so
+# neither can remove the directory it created and both back off from an unowned
+# lock path. Probing costs one process its own three spawns, once, and keeps
+# that damage away from every real lock.
+# An unwritable directory reports native, so the ordinary create path runs and
+# fails on its own terms rather than on a probe.
+fm_lock_symlinks_degraded() {  # <directory>
+  local dir=$1 owner link
+  if [ "$FM_LOCK_SYMLINK_MODE" = unknown ]; then
+    FM_LOCK_SYMLINK_MODE=native
+    if owner=$(mktemp -d "$dir/.fm-symprobe.XXXXXX" 2>/dev/null); then
+      link="$owner.link"
+      if ln -s "$owner" "$link" 2>/dev/null && [ -L "$link" ]; then
+        rm -f "$link" 2>/dev/null || true
+      else
+        FM_LOCK_SYMLINK_MODE=degraded
+        if [ -d "$link" ] && [ ! -L "$link" ]; then
+          fm_lock_clean_known_files "$link"
+          rmdir "$link" 2>/dev/null || true
+        else
+          rm -f "$link" 2>/dev/null || true
+        fi
+      fi
+      rmdir "$owner" 2>/dev/null || true
+    fi
+  fi
+  [ "$FM_LOCK_SYMLINK_MODE" = degraded ]
+}
+
+# Do we still hold this lock or steal? The symlink protocol proves it from the
+# link target; the bare-directory protocol records the directory as its own
+# owner, so there is no target and the pid is the proof.
+fm_lock_holds_owner() {
+  local path=$1 ownerdir=$2
+  fm_lock_points_to_owner "$path" "$ownerdir" && return 0
+  [ -n "$ownerdir" ] && [ "$ownerdir" = "$path" ] \
+    && [ -d "$path" ] && [ ! -L "$path" ] \
+    && [ "$(cat "$path/pid" 2>/dev/null || true)" = "${BASHPID:-$$}" ]
+}
+
 fm_lock_claim_blocked_by_steal() {
   local lockdir=$1 allowed_steal_owner=${2:-} steal
   steal="$lockdir.steal"
   [ -e "$steal" ] || [ -L "$steal" ] || return 1
-  if [ -n "$allowed_steal_owner" ] && fm_lock_points_to_owner "$steal" "$allowed_steal_owner"; then
+  if [ -n "$allowed_steal_owner" ] && fm_lock_holds_owner "$steal" "$allowed_steal_owner"; then
     return 1
   fi
+  return 0
+}
+
+# Clean up whatever a degraded "ln -s" published on OUR behalf, and report
+# whether it proved the host cannot publish symlinks. The copy takes one of two
+# shapes: our owner directory copied to the lock path, or - when the lock path
+# already existed - copied inside it under our owner directory's name. Both are
+# identified by our own pid, so another holder's lock is never touched.
+fm_lock_reap_degraded_copy() {
+  local lockdir=$1 ownerdir=$2 mypid nested
+  mypid=${BASHPID:-$$}
+  if [ -d "$lockdir" ] && [ ! -L "$lockdir" ] \
+    && [ "$(cat "$lockdir/pid" 2>/dev/null || true)" = "$mypid" ]; then
+    fm_lock_clean_known_files "$lockdir"
+    # Report only what we actually removed. A concurrent racer's copy can be
+    # nested inside ours, and rmdir then fails; claiming success there leaves an
+    # unowned directory at the lock path that every racer backs off from.
+    rmdir "$lockdir" 2>/dev/null
+    return
+  fi
+  nested="$lockdir/${ownerdir##*/}"
+  if [ -d "$nested" ] && [ ! -L "$nested" ] \
+    && [ "$(cat "$nested/pid" 2>/dev/null || true)" = "$mypid" ]; then
+    fm_lock_clean_known_files "$nested"
+    rmdir "$nested" 2>/dev/null
+    return
+  fi
+  return 1
+}
+
+# Bare-directory lock protocol, for hosts where "ln -s" cannot publish a link.
+# mkdir is the atomic publication - exactly one creator wins - and the pid file
+# follows it. Every reader already understands this shape: fm_lock_release,
+# fm_lock_remove_path and fm_lock_recheck_stale_owner each carry a
+# plain-directory branch, and fm_lock_mid_acquire_is_fresh covers the brief
+# window between mkdir and the pid write, when the directory has no owner yet.
+fm_lock_try_create_bare() {
+  local lockdir=$1 allowed_steal_owner=${2:-} mypid back
+  mypid=${BASHPID:-$$}
+  FM_LOCK_OWNER_DIR=
+  mkdir "$lockdir" 2>/dev/null || return 1
+  if ! { printf '%s\n' "$mypid" > "$lockdir/pid"; } 2>/dev/null; then
+    fm_lock_remove_path "$lockdir" || true
+    return 1
+  fi
+  back=$(cat "$lockdir/pid" 2>/dev/null || true)
+  if [ "$back" != "$mypid" ]; then
+    fm_lock_remove_path "$lockdir" || true
+    return 1
+  fi
+  if fm_lock_claim_blocked_by_steal "$lockdir" "$allowed_steal_owner"; then
+    fm_lock_remove_path "$lockdir" || true
+    return 1
+  fi
+  FM_LOCK_OWNER_DIR=$lockdir
   return 0
 }
 
@@ -413,8 +568,16 @@ fm_lock_claim() {
 }
 
 fm_lock_try_create() {
-  local lockdir=$1 allowed_steal_owner=${2:-} ownerdir
+  local lockdir=$1 allowed_steal_owner=${2:-} ownerdir dir
   FM_LOCK_OWNER_DIR=
+  # A host that cannot publish a symlink uses the bare-directory protocol, where
+  # mkdir is the atomic publication. POSIX hosts never reach this branch.
+  dir=${lockdir%/*}
+  [ "$dir" != "$lockdir" ] || dir=.
+  if fm_lock_symlinks_degraded "$dir"; then
+    fm_lock_try_create_bare "$lockdir" "$allowed_steal_owner"
+    return
+  fi
   ownerdir=$(fm_lock_owner_dir "$lockdir") || return 1
   if [ -e "$lockdir" ] || [ -L "$lockdir" ]; then
     fm_lock_discard_owner "$ownerdir"
@@ -425,6 +588,7 @@ fm_lock_try_create() {
     return 1
   fi
   if ln -s "$ownerdir" "$lockdir" 2>/dev/null && fm_lock_points_to_owner "$lockdir" "$ownerdir"; then
+    FM_LOCK_SYMLINK_MODE=native
     if fm_lock_claim "$lockdir" "$ownerdir" "$allowed_steal_owner"; then
       FM_LOCK_OWNER_DIR=$ownerdir
       return 0
@@ -433,6 +597,17 @@ fm_lock_try_create() {
       rm -f "$lockdir" 2>/dev/null || true
     fi
   else
+    # "ln -s" can report success and still publish a directory copy rather than
+    # a link (MSYS without winsymlinks). That copy is what used to be left at
+    # the lock path with a pid nobody would ever clean, blocking the existence
+    # guard above forever. Remove only our own copy, record the degradation for
+    # the rest of this process, and retry under the bare-directory protocol.
+    if [ ! -L "$lockdir" ] && fm_lock_reap_degraded_copy "$lockdir" "$ownerdir"; then
+      FM_LOCK_SYMLINK_MODE=degraded
+      fm_lock_discard_owner "$ownerdir"
+      fm_lock_try_create_bare "$lockdir" "$allowed_steal_owner"
+      return
+    fi
     fm_lock_remove_stray_owner_link "$lockdir" "$ownerdir"
   fi
   fm_lock_discard_owner "$ownerdir"
@@ -791,8 +966,28 @@ fm_recovery_marker_reopen_announced() {
   fm_recovery_transition "$1" reopen-announced
 }
 
+# Is this steal artifact provably abandoned? It reuses fm_lock_recheck_stale_owner
+# so the fail-safe rule is the same one the ordinary reclaim path uses: an
+# unreadable pid, a live owner, or an unreadable mtime all mean "not stale".
+fm_lock_steal_is_stale() {
+  local steal=$1 pid
+  local owner=''
+  [ -e "$steal" ] || [ -L "$steal" ] || return 1
+  pid=$(cat "$steal/pid" 2>/dev/null || true)
+  # Cheap early-out for the ordinary contended case. A live holder is never
+  # stale, and every polled attempt would otherwise pay the link and mtime
+  # reads; on a host whose forks are expensive that cost lands on exactly the
+  # attempts that are already losing a race.
+  fm_pid_alive "$pid" && return 1
+  if [ -L "$steal" ]; then
+    owner=$(fm_lock_link_owner "$steal" 2>/dev/null || true)
+    [ -n "$owner" ] || return 1
+  fi
+  fm_lock_recheck_stale_owner "$steal" "$owner" "$pid"
+}
+
 fm_lock_try_acquire() {
-  local lockdir=$1 pid steal cur rc steal_owner primary_owner
+  local lockdir=$1 pid steal cur rc steal_owner primary_owner steal_depth_prev
   FM_LOCK_HELD_PID=
   FM_LOCK_OWNER_DIR=
   FM_LOCK_RECOVERED_PID=
@@ -830,11 +1025,28 @@ fm_lock_try_acquire() {
   fi
 
   steal="$lockdir.steal"
-  if ! fm_lock_try_acquire "$steal"; then
+  # Reclaim a provably abandoned steal in place. Recursing into it instead is
+  # what appended one ".steal" suffix per attempt until a 40-level chain
+  # accumulated, with no level ever converging.
+  if fm_lock_steal_is_stale "$steal"; then
+    fm_lock_remove_path "$steal" || true
+  fi
+  steal_depth_prev=$FM_LOCK_STEAL_DEPTH
+  if [ "$steal_depth_prev" -ge "$FM_LOCK_STEAL_MAX_DEPTH" ]; then
+    printf 'fm-lock: refusing to nest steal recovery past %s level(s) at %s\n' \
+      "$FM_LOCK_STEAL_MAX_DEPTH" "$steal" >&2
     FM_LOCK_HELD_PID=$(cat "$lockdir/pid" 2>/dev/null || true)
     FM_LOCK_OWNER_DIR=
     return 1
   fi
+  FM_LOCK_STEAL_DEPTH=$((steal_depth_prev + 1))
+  if ! fm_lock_try_acquire "$steal"; then
+    FM_LOCK_STEAL_DEPTH=$steal_depth_prev
+    FM_LOCK_HELD_PID=$(cat "$lockdir/pid" 2>/dev/null || true)
+    FM_LOCK_OWNER_DIR=
+    return 1
+  fi
+  FM_LOCK_STEAL_DEPTH=$steal_depth_prev
   steal_owner=${FM_LOCK_OWNER_DIR:-}
 
   cur=$(cat "$lockdir/pid" 2>/dev/null || true)
@@ -850,7 +1062,7 @@ fm_lock_try_acquire() {
     FM_LOCK_OWNER_DIR=
     return 1
   fi
-  if ! fm_lock_points_to_owner "$steal" "$steal_owner"; then
+  if ! fm_lock_holds_owner "$steal" "$steal_owner"; then
     fm_lock_release "$steal"
     FM_LOCK_HELD_PID=$(cat "$lockdir/pid" 2>/dev/null || true)
     FM_LOCK_OWNER_DIR=
@@ -892,11 +1104,142 @@ fm_lock_try_acquire() {
   return "$rc"
 }
 
+# fm_lock_acquire_wait <lockdir> [max-seconds]
+#
+# Blocking acquire, bounded by FM_LOCK_ACQUIRE_WAIT_MAX seconds unless the
+# caller passes its own ceiling; 0 means unbounded, for a caller already under
+# an outer deadline. On expiry it names the exact path and the reason on stderr,
+# leaves that reason in FM_LOCK_WAIT_FAIL_REASON, and returns non-zero. It never
+# returns as though it acquired.
+#
+# Callers that check the return value handle the refusal themselves. Every other
+# caller must use fm_lock_acquire_wait_or_die: continuing into a critical
+# section without the lock would corrupt shared records, which is strictly worse
+# than the hang this bound replaces.
 fm_lock_acquire_wait() {
-  local lockdir=$1
+  local lockdir=$1 max=${2:-$FM_LOCK_ACQUIRE_WAIT_MAX} start held
+  case "$max" in ''|*[!0-9]*) max=120 ;; esac
+  FM_LOCK_WAIT_FAIL_REASON=
+  start=$SECONDS
   while ! fm_lock_try_acquire "$lockdir"; do
+    if [ "$max" -ne 0 ] && [ "$((SECONDS - start))" -ge "$max" ]; then
+      held=${FM_LOCK_HELD_PID:-}
+      if [ -n "$held" ] && fm_pid_alive "$held"; then
+        FM_LOCK_WAIT_FAIL_REASON="held by live pid $held"
+      elif [ -n "$held" ]; then
+        FM_LOCK_WAIT_FAIL_REASON="record for pid $held could not be reclaimed"
+      else
+        FM_LOCK_WAIT_FAIL_REASON="lock could not be published or reclaimed"
+      fi
+      printf 'fm-lock: gave up after %ss waiting for %s (%s)\n' \
+        "$max" "$lockdir" "$FM_LOCK_WAIT_FAIL_REASON" >&2
+      return 1
+    fi
     sleep 0.1
   done
+  return 0
+}
+
+# Fail-closed acquire for the call sites that cannot handle a refusal.
+fm_lock_acquire_wait_or_die() {
+  local lockdir=$1
+  fm_lock_acquire_wait "$lockdir" && return 0
+  printf 'fm-lock: cannot proceed without %s; stopping rather than continuing unlocked\n' \
+    "$lockdir" >&2
+  exit 1
+}
+
+# Acquire in the timed helper process, then transfer the lock record to the
+# waiting caller before exiting. The lock's ordinary stale-owner recovery makes
+# every interruption safe: before transfer the helper is the owner; after
+# transfer the still-live caller is the owner.
+_fm_lock_acquire_wait_handoff() {  # <lockdir> <caller-pid>
+  local lockdir=$1 caller_pid=$2 ownerdir current back
+  case "$caller_pid" in ''|*[!0-9]*) return 1 ;; esac
+  fm_pid_alive "$caller_pid" || return 1
+  trap 'fm_lock_release "$lockdir"; exit 143' TERM INT
+  # Unbounded here on purpose: fm_run_timed in fm_lock_acquire_wait_bounded
+  # already owns this helper's deadline, and an inner bound would convert its
+  # timeout result into a plain failure.
+  fm_lock_acquire_wait "$lockdir" 0 || return 1
+  if [ -L "$lockdir" ]; then
+    ownerdir=$(fm_lock_link_owner "$lockdir" 2>/dev/null) || {
+      fm_lock_release "$lockdir"
+      return 1
+    }
+  else
+    ownerdir=$lockdir
+  fi
+  current=${BASHPID:-$$}
+  back=$(cat "$ownerdir/pid" 2>/dev/null || true)
+  if [ "$back" != "$current" ] \
+    || ! printf '%s\n' "$caller_pid" > "$ownerdir/pid" 2>/dev/null \
+    || [ "$(cat "$ownerdir/pid" 2>/dev/null || true)" != "$caller_pid" ]; then
+    fm_lock_release "$lockdir"
+    return 1
+  fi
+  trap - TERM INT
+}
+
+# fm_lock_acquire_wait_bounded <lockdir> <positive-seconds>
+#
+# Bounded acquire variant. It preserves the ordinary wait/reclaim behavior
+# until fm-timeout-lib.sh's hard deadline, returns 124 when a live holder still
+# owns the lock, and leaves FM_LOCK_HELD_PID naming that holder.
+# Use it where a caller must refuse rather than block: wake presentation, and
+# the guarded remote link clear, whose whole contract is to return a
+# reconciliation refusal instead of wedging an unattended close.
+# Mutation-critical callers that can safely block keep fm_lock_acquire_wait,
+# which is itself bounded now and refuses rather than spinning forever.
+fm_lock_acquire_wait_bounded() {
+  local lockdir=$1 seconds=$2 caller_pid rc owner_pid
+  case "$seconds" in ''|*[!0-9]*|0) return 2 ;; esac
+  _fm_wake_require_timeout || return 1
+  if fm_lock_try_acquire "$lockdir"; then
+    return 0
+  fi
+
+  caller_pid=${BASHPID:-$$}
+  # shellcheck disable=SC2016 # Positional parameters expand in the child shell.
+  if fm_run_timed "$seconds" env \
+    "FM_STATE_OVERRIDE=$STATE" \
+    "FM_ROOT_OVERRIDE=$FM_ROOT" \
+    "FM_LOCK_STALE_AFTER=$FM_LOCK_STALE_AFTER" \
+    bash -c '. "$1"; _fm_lock_acquire_wait_handoff "$2" "$3"' \
+      _ "$FM_WAKE_LIB_DIR/fm-wake-lib.sh" "$lockdir" "$caller_pid" \
+      </dev/null >/dev/null 2>&1; then
+    rc=0
+  else
+    rc=$?
+  fi
+
+  owner_pid=$(cat "$lockdir/pid" 2>/dev/null || true)
+  if [ "$owner_pid" = "$caller_pid" ]; then
+    return 0
+  fi
+  [ "$rc" -ne 0 ] || rc=1
+  # A deadline can kill the helper just after it acquired and before handoff.
+  # Give ordinary stale-owner recovery one final non-blocking chance so that
+  # helper cleanup cannot manufacture a false contention advisory.
+  if fm_lock_try_acquire "$lockdir"; then
+    return 0
+  fi
+  if [ "$rc" -eq 124 ]; then
+    owner_pid=$(cat "$lockdir/pid" 2>/dev/null || true)
+    case "$owner_pid" in
+      ''|*[!0-9]*|0) ;;
+      *)
+        if [ "$owner_pid" -gt 0 ] 2>/dev/null && fm_pid_alive "$owner_pid"; then
+          FM_LOCK_HELD_PID=$owner_pid
+          return 124
+        fi
+        ;;
+    esac
+    # shellcheck disable=SC2034 # Output read by callers after bounded acquisition.
+    FM_LOCK_HELD_PID=
+    return 1
+  fi
+  return "$rc"
 }
 
 fm_lock_release() {
@@ -1380,7 +1723,7 @@ fm_wake_append() {
   recovery_marker="$STATE/.watcher-down"
   status=0
 
-  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
+  fm_lock_acquire_wait_or_die "$FM_WAKE_QUEUE_LOCK"
   _fm_recovery_marker_publish "$recovery_marker" downtime || status=$?
   if [ "$status" -eq 0 ]; then
     seq=$(cat "$seq_file" 2>/dev/null || echo 0)
@@ -1409,7 +1752,7 @@ fm_wake_queued_keys() {
     signal|stale|check|heartbeat) ;;
     *) printf 'fm_wake_queued_keys: invalid wake kind: %s\n' "$kind" >&2; return 2 ;;
   esac
-  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
+  fm_lock_acquire_wait_or_die "$FM_WAKE_QUEUE_LOCK"
   fm_wake_queued_keys_locked "$kind"
   fm_lock_release "$FM_WAKE_QUEUE_LOCK"
 }

@@ -76,12 +76,13 @@ SH
   ln -s "$ROOT/bin/fm-gate-refuse-lib.sh" "$fake/bin/fm-gate-refuse-lib.sh"
   # fm-pr-lib.sh: teardown uses its canonical task-ID validator for poll cleanup.
   ln -s "$ROOT/bin/fm-pr-lib.sh" "$fake/bin/fm-pr-lib.sh"
-  # fm-public-followup-lib.sh (and the fm-x-lib.sh it sources): teardown sources
-  # it for the relay-activation gate on the promised-public-reply check. Neither
-  # does anything in this fixture, which has no .env, but both are real siblings
-  # teardown now requires.
+  # fm-public-followup-lib.sh (and the fm-x-lib.sh and fm-env-lib.sh it
+  # sources): teardown sources it for the relay-activation gate on the
+  # promised-public-reply check. None does anything in this fixture, which has
+  # no .env, but all three are real siblings teardown now requires.
   ln -s "$ROOT/bin/fm-public-followup-lib.sh" "$fake/bin/fm-public-followup-lib.sh"
   ln -s "$ROOT/bin/fm-x-lib.sh" "$fake/bin/fm-x-lib.sh"
+  ln -s "$ROOT/bin/fm-env-lib.sh" "$fake/bin/fm-env-lib.sh"
   ln -s "$ROOT/bin/fm-secondmate-registry-lib.sh" "$fake/bin/fm-secondmate-registry-lib.sh"
   ln -s "$ROOT/bin/fm-secondmate-parent-lib.sh" "$fake/bin/fm-secondmate-parent-lib.sh"
   # Receiver-wake retirement sources the pending-reply library, which in turn
@@ -108,6 +109,8 @@ SH
   # fused backlog close is skipped and the follow-up echo takes the plain-message
   # path; there is no tasks-axi and no backlog in this fixture.
   cat > "$fake/bin/fm-tasks-axi-lib.sh" <<'SH'
+FM_TASKS_AXI_MIN=0.2.4
+fm_tasks_axi_backend() { printf 'markdown\n'; }
 fm_tasks_axi_backend_available() { return 1; }
 fm_tasks_axi_compatible() { return 1; }
 fm_backlog_backend_manual() { return 1; }
@@ -174,12 +177,13 @@ SH
   ln -s "$ROOT/bin/fm-gate-refuse-lib.sh" "$fake/bin/fm-gate-refuse-lib.sh"
   # fm-pr-lib.sh: teardown uses its canonical task-ID validator for poll cleanup.
   ln -s "$ROOT/bin/fm-pr-lib.sh" "$fake/bin/fm-pr-lib.sh"
-  # fm-public-followup-lib.sh (and the fm-x-lib.sh it sources): teardown sources
-  # it for the relay-activation gate on the promised-public-reply check. Neither
-  # does anything in this fixture, which has no .env, but both are real siblings
-  # teardown now requires.
+  # fm-public-followup-lib.sh (and the fm-x-lib.sh and fm-env-lib.sh it
+  # sources): teardown sources it for the relay-activation gate on the
+  # promised-public-reply check. None does anything in this fixture, which has
+  # no .env, but all three are real siblings teardown now requires.
   ln -s "$ROOT/bin/fm-public-followup-lib.sh" "$fake/bin/fm-public-followup-lib.sh"
   ln -s "$ROOT/bin/fm-x-lib.sh" "$fake/bin/fm-x-lib.sh"
+  ln -s "$ROOT/bin/fm-env-lib.sh" "$fake/bin/fm-env-lib.sh"
   ln -s "$ROOT/bin/fm-secondmate-registry-lib.sh" "$fake/bin/fm-secondmate-registry-lib.sh"
   ln -s "$ROOT/bin/fm-secondmate-parent-lib.sh" "$fake/bin/fm-secondmate-parent-lib.sh"
   ln -s "$ROOT/bin/fm-pending-reply-lib.sh" "$fake/bin/fm-pending-reply-lib.sh"
@@ -198,6 +202,8 @@ exit 0
 SH
   chmod +x "$fake/bin/fm-fleet-sync.sh"
   cat > "$fake/bin/fm-tasks-axi-lib.sh" <<'SH'
+FM_TASKS_AXI_MIN=0.2.4
+fm_tasks_axi_backend() { printf 'markdown\n'; }
 fm_tasks_axi_backend_available() { return 1; }
 fm_tasks_axi_compatible() { return 1; }
 fm_backlog_backend_manual() { return 1; }

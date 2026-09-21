@@ -7,19 +7,21 @@
 #   fm-procevent-lavish.sh terminal <result-file>
 #   fm-procevent-lavish.sh silent <result-file>
 #   fm-procevent-lavish.sh answers <result-file>
+#   fm-procevent-lavish.sh reconciles <result-file>
 #   fm-procevent-lavish.sh read <result-file>
 #   fm-procevent-lavish.sh source-id <artifact.html>
 #   fm-procevent-lavish.sh retire <artifact.html>
 #   fm-procevent-lavish.sh poll <artifact.html>
 #
 # classify   Print the lifecycle state a handler should act on: feedback, ended,
-#            waiting, missing, or unknown.
+#            waiting, disconnected, missing, or unknown.
 # read       Print a structured presentation of one already-captured result so a
 #            handler consumes every queued item without grepping the raw file.
 #            It is read-only over the capture: it does not arm, poll, or change
-#            what Lavish delivered. The session-ending freeform message
-#            (tag=message) is its own labeled field, printed first and distinct
-#            from per-element annotations. Declared and presented item counts,
+#            what Lavish delivered. The freeform message (tag=message) is its
+#            own labeled field, printed first and distinct from per-element
+#            annotations; it is labeled SESSION-ENDING MESSAGE only when the
+#            session ended. Declared and presented item counts,
 #            plus a completeness verdict, follow before all annotations so a
 #            partial read is obvious. Each annotation retains its element uid,
 #            selector, tag, and text. A non-choice freeform comment (`prompt`)
@@ -46,9 +48,10 @@
 # Closing a review surface that carried nothing is the single most common Lavish
 # result: the captain reads a board, says nothing, and closes it. Announcing that
 # put a wake in front of the handler whose entire content was that nothing
-# happened. `silent` therefore holds one narrow, positively-determined shape -
+# happened. `silent` therefore holds two narrow, positively-determined shapes -
 # a session this adapter classifies `ended` that carries no queued content block
-# at all - and every other result stays announced.
+# at all, or `browser_disconnected`, which carries no answer while the session
+# remains open - and every other result stays announced.
 #
 # Deliberately narrow, in both directions. A `Send & End` close carrying the
 # captain's actual answer arrives as `status: feedback` with `session_ended`, so
@@ -64,6 +67,13 @@
 # canonical source identity, the argv for the currently published poll command,
 # and how to read a completed result. Ownership, durable capture, publication,
 # and restart recovery all belong to bin/fm-procevent.sh.
+#
+# The published poll vocabulary includes feedback, ended, waiting, and
+# browser_disconnected. A waiting result from this no-timeout poll means a
+# second poller was present; it is not a normal idle round. browser_disconnected
+# means the session remains open and is handled as a silent reconnect wait.
+# The poll reads config/lavish-axi-host from FM_HOME before every lavish-axi
+# invocation so firstmate and workers reach the same server.
 #
 # `answers` is this adapter's half of the generic keyed-answer contract in
 # bin/fm-procevent.sh. It reports what the captain actually chose, as
@@ -96,7 +106,7 @@
 # That is an internal retry, not news, so registering the raw poll made the
 # generic runner capture it and wake the whole fleet. `poll` therefore re-runs
 # the published poll up to POLL_RETRY_LIMIT times for that exact response, with
-# POLL_RETRY_DELAY_DEFAULT seconds between attempts. The match is exact and
+# attempt starts at least POLL_RETRY_DELAY_DEFAULT seconds apart. The match is exact and
 # deliberately narrow: real feedback, ended and missing sessions, any other
 # SERVER_ERROR, and the same interruption still standing after the bound is
 # spent are all printed straight through and captured normally. The retry is a
@@ -123,7 +133,50 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 . "$SCRIPT_DIR/fm-procevent-lib.sh"
 
 die() { printf 'error: %s\n' "$1" >&2; exit 1; }
-usage() { sed -n '2,111p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,/^set -u$/p' "${BASH_SOURCE[0]}" | sed '$d; s/^# \{0,1\}//'; exit 2; }
+
+apply_configured_lavish_host() {
+  local original_present=$1 original_host=$2 host_file host rc
+  host_file="${FM_HOME%/}/config/lavish-axi-host"
+  host=$(perl -MFcntl=:mode -e '
+    use strict;
+    use warnings;
+    my ($path) = @ARGV;
+    if (!lstat $path) {
+      exit 10 if $!{ENOENT};
+      exit 11;
+    }
+    open my $file, "<", $path or exit 11;
+    my @stat = stat $file;
+    exit 11 unless @stat && S_ISREG($stat[2]);
+    while (1) {
+      my $count = read $file, my $chunk, 65536;
+      exit 12 unless defined $count;
+      last if $count == 0;
+      print $chunk or exit 12;
+    }
+  ' "$host_file")
+  rc=$?
+  case "$rc" in
+    0) ;;
+    10)
+      if [ "$original_present" = 1 ]; then
+        export LAVISH_AXI_HOST=$original_host
+      else
+        unset LAVISH_AXI_HOST
+      fi
+      return 0
+      ;;
+    11) die "config/lavish-axi-host must be a readable regular file" ;;
+    *) die "cannot read config/lavish-axi-host" ;;
+  esac
+  case "$host" in
+    ''|*[[:space:][:cntrl:]]*)
+      die "config/lavish-axi-host must contain one non-empty address without whitespace"
+      ;;
+  esac
+  export LAVISH_AXI_HOST=$host
+}
 
 # Canonical identity is physical, not the path string: Lavish itself keys a
 # session on the realpath of the artifact, so two names for one file are one
@@ -174,6 +227,7 @@ cmd_retire() {
 # without waiting it out.
 POLL_RETRY_LIMIT=12
 POLL_RETRY_DELAY_DEFAULT=5
+POLL_RETRY_DELAY_MIN=1
 POLL_RETRY_DELAY_MAX=60
 
 # Exit 0 only for the exact two-line interruption, and nothing else. The whole
@@ -226,8 +280,8 @@ poll_response_filter() {  # <response-file>
   ' "$1"
 }
 
-# Seconds between retries. FM_LAVISH_POLL_RETRY_DELAY is a bounded test
-# override; a malformed or out-of-range value is refused rather than quietly
+# Minimum seconds between retry attempt starts. FM_LAVISH_POLL_RETRY_DELAY is a
+# bounded test override; a malformed or out-of-range value is refused rather than quietly
 # rounded, because silently changing a retry cadence is how a bound stops
 # meaning anything.
 poll_retry_delay() {
@@ -237,17 +291,34 @@ poll_retry_delay() {
     return 0
   fi
   case "$delay" in
-    *[!0-9]*) die "FM_LAVISH_POLL_RETRY_DELAY must be whole seconds from 0 to $POLL_RETRY_DELAY_MAX: $delay" ;;
+    *[!0-9]*) die "FM_LAVISH_POLL_RETRY_DELAY must be whole seconds from $POLL_RETRY_DELAY_MIN to $POLL_RETRY_DELAY_MAX: $delay" ;;
   esac
-  [ "$delay" -le "$POLL_RETRY_DELAY_MAX" ] \
-    || die "FM_LAVISH_POLL_RETRY_DELAY must be whole seconds from 0 to $POLL_RETRY_DELAY_MAX: $delay"
+  [ "$delay" -ge "$POLL_RETRY_DELAY_MIN" ] && [ "$delay" -le "$POLL_RETRY_DELAY_MAX" ] \
+    || die "FM_LAVISH_POLL_RETRY_DELAY must be whole seconds from $POLL_RETRY_DELAY_MIN to $POLL_RETRY_DELAY_MAX: $delay"
   printf '%s\n' "$delay"
 }
 
+poll_iteration_started() {
+  perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC -e \
+    'printf "%.6f\\n", clock_gettime(CLOCK_MONOTONIC)'
+}
+
+poll_iteration_floor_wait() {
+  perl -MTime::HiRes=clock_gettime,sleep,CLOCK_MONOTONIC -e '
+    my ($started, $floor) = @ARGV;
+    my $remaining = $floor - (clock_gettime(CLOCK_MONOTONIC) - $started);
+    sleep($remaining) if $remaining > 0;
+  ' "$1" "$2"
+}
+
 cmd_poll() {
-  local artifact=${1-} delay attempt=0 response cleanup_command rc filter_rc
-  local pipeline_status
+  local artifact=${1-} delay attempt=0 response cleanup_command rc filter_rc iteration_started
+  local pipeline_status original_host_present=0 original_host=
   [ -n "$artifact" ] || usage
+  if [ "${LAVISH_AXI_HOST+x}" = x ]; then
+    original_host_present=1
+    original_host=$LAVISH_AXI_HOST
+  fi
   [ "$#" -eq 1 ] || usage
   command -v lavish-axi >/dev/null 2>&1 || die "lavish-axi is not installed"
   delay=$(poll_retry_delay) || exit 1
@@ -265,6 +336,8 @@ cmd_poll() {
     trap "$cleanup_command; trap - $signal; kill -$signal $$" "$signal"
   done
   while :; do
+    iteration_started=$(poll_iteration_started) || die "cannot start the poll rate governor"
+    apply_configured_lavish_host "$original_host_present" "$original_host"
     lavish-axi poll "$artifact" | poll_response_filter "$response"
     pipeline_status=("${PIPESTATUS[@]}")
     rc=${pipeline_status[0]}
@@ -274,7 +347,8 @@ cmd_poll() {
       10)
         if [ "$attempt" -lt "$POLL_RETRY_LIMIT" ]; then
           attempt=$((attempt + 1))
-          sleep "$delay"
+          poll_iteration_floor_wait "$iteration_started" "$delay" \
+            || die "cannot enforce the poll rate governor"
         else
           cat -- "$response"
           break
@@ -308,9 +382,10 @@ cmd_classify() {
   [ -f "$file" ] || die "result file does not exist: $file"
   status=$(session_field "$file" status)
   case "$status" in
-    feedback) printf 'feedback\n'; return 0 ;;
-    ended)    printf 'ended\n'; return 0 ;;
-    waiting)  printf 'waiting\n'; return 0 ;;
+    feedback)            printf 'feedback\n'; return 0 ;;
+    ended)               printf 'ended\n'; return 0 ;;
+    waiting)             printf 'waiting\n'; return 0 ;;
+    browser_disconnected) printf 'disconnected\n'; return 0 ;;
   esac
   error_message=$(awk 'NR == 1 && /^error:[[:space:]]*/ { sub(/^error:[[:space:]]*/, ""); print }' "$file")
   error_code=$(awk '
@@ -384,6 +459,7 @@ cmd_silent() {
   local file=${1-} content_rc
   [ -n "$file" ] || usage
   [ -f "$file" ] && [ ! -L "$file" ] || die "result file does not exist: $file"
+  [ "$(cmd_classify "$file")" = disconnected ] && return 0
   [ "$(cmd_classify "$file")" = ended ] || return 1
   result_has_queued_content "$file"
   content_rc=$?
@@ -393,7 +469,7 @@ cmd_silent() {
   [ "$content_rc" -eq 1 ]
 }
 
-# Print `key<TAB>answer<TAB>label[<TAB>mode]` for every structured choice the
+# Print `key<TAB>answer<TAB>label[<TAB>mode]` for each non-reconcile structured choice the
 # captain submitted in a captured result; the optional mode column relays the
 # card's declared close mode (`done` or `release`) to the keyed-answer intake. The published response frames queued feedback as
 # a `prompts[N]{field,...}:` header followed by exactly N indented CSV rows whose
@@ -401,18 +477,20 @@ cmd_silent() {
 # rather than assuming a fixed column, and takes only rows whose `tag` field is
 # `choice`. A freeform `message` row is captain prose and is deliberately never a
 # source of decision keys. A row that does not carry both a slug-shaped `question`
-# and an `answer` inside its `Context data:` block is skipped, so a deck that does
-# not key its forms by decision key simply yields nothing.
+# and the versioned `selection` and `note` fields inside its `Context data:` block
+# is skipped. A time-limited rollout branch accepts the old question/answer
+# shape only for ordinary answers and rejects its bare or annotated reconcile
+# values because old rows do not separate the selected option from its note.
 # The question cap is 128 so any task id fits, including the long legacy
 # `<origin>-decision-<key>` identities pre-collapse decks still carry; the
 # security property is the slug SHAPE, which is unchanged.
-cmd_answers() {
-  local file=${1-}
+cmd_choice_rows() {
+  local selection=$1 file=${2-}
   [ -n "$file" ] || usage
   [ -f "$file" ] && [ ! -L "$file" ] || die "result file does not exist: $file"
   perl -MJSON::PP -e '
     use strict; use warnings;
-    my ($path) = @ARGV;
+    my ($selection, $path) = @ARGV;
     open my $fh, "<", $path or exit 1;
     my (@fields, $want, @rows);
     while (my $line = <$fh>) {
@@ -428,7 +506,7 @@ cmd_answers() {
     }
     close $fh;
     my %seen;
-    my @out;
+    my @choices;
     for my $row (@rows) {
       $row =~ s/^\s+//;
       my @vals;
@@ -451,33 +529,76 @@ cmd_answers() {
       my $ctx = $1;
       my $data = eval { decode_json($ctx) };
       next unless ref($data) eq "HASH";
-      my $key = $data->{question};
-      my $answer = $data->{answer};
-      next if !defined($key) || ref($key) || !defined($answer) || ref($answer);
+      my ($key, $selected, $note, $answer, $legacy);
+      if (defined($data->{schema}) && !ref($data->{schema})
+          && $data->{schema} eq "fm-bearings-answer.v1") {
+        $key = $data->{question};
+        $selected = $data->{selection};
+        $note = $data->{note};
+        next if !defined($key) || ref($key) || !defined($selected) || ref($selected)
+          || !defined($note) || ref($note);
+        next unless $selected eq "" || $selected =~ /\A[A-Za-z0-9._-]{1,128}\z/;
+        next unless length($note) <= 512;
+        next unless length($selected) || length($note);
+        $answer = length($selected) ? $selected : $note;
+        $legacy = 0;
+      # Time-limited compatibility for captures from pre-change boards; remove
+      # once no board carrying the old question/answer context can remain armed.
+      } elsif (!exists($data->{schema}) && !exists($data->{selection})
+          && !exists($data->{note})) {
+        $key = $data->{question};
+        $answer = $data->{answer};
+        next if !defined($key) || ref($key) || !defined($answer) || ref($answer);
+        next unless length($answer) && length($answer) <= 512;
+        next if $answer eq "reconcile" || index($answer, "reconcile - ") == 0;
+        $selected = "";
+        $note = "";
+        $legacy = 1;
+      } else {
+        next;
+      }
+      next unless $key =~ /\A[A-Za-z0-9._-]{1,128}\z/;
       my $mode = "";
       if (exists $data->{close}) {
         next if !defined($data->{close}) || ref($data->{close})
           || ($data->{close} ne "done" && $data->{close} ne "release");
         $mode = $data->{close};
       }
-      next unless $key =~ /\A[A-Za-z0-9._-]{1,128}\z/;
-      next unless length $answer && length($answer) <= 512;
       my $label = defined $f{text} ? $f{text} : "";
-      s/[\x00-\x1f\x7f]/ /g for ($answer, $label);
+      s/[\x00-\x1f\x7f]/ /g for ($answer, $note, $label);
       $label = substr($label, 0, 512);
-      # A re-answered form appears again later in the queue; the last submission wins.
-      if (defined $seen{$key}) { $out[$seen{$key}] = undef }
-      $seen{$key} = scalar @out;
-      push @out, length $mode ? "$key\t$answer\t$label\t$mode" : "$key\t$answer\t$label";
+      if (defined $seen{$key}) { $choices[$seen{$key}] = undef }
+      $seen{$key} = scalar @choices;
+      push @choices, {
+        key => $key, selection => $selected, note => $note, legacy => $legacy,
+        answer => $answer, label => $label, mode => $mode
+      };
     }
-    print "$_\n" for grep { defined } @out;
-  ' "$file"
+    for my $choice (grep { defined } @choices) {
+      if ($selection eq "reconciles") {
+        next if $choice->{legacy};
+        if ($choice->{selection} eq "reconcile") {
+          print length($choice->{note})
+            ? "$choice->{key}\t$choice->{note}\n"
+            : "$choice->{key}\n";
+        }
+        next;
+      }
+      next if $choice->{selection} eq "reconcile";
+      print length $choice->{mode}
+        ? "$choice->{key}\t$choice->{answer}\t$choice->{label}\t$choice->{mode}\n"
+        : "$choice->{key}\t$choice->{answer}\t$choice->{label}\n";
+    }
+  ' "$selection" "$file"
 }
 
+cmd_answers() { cmd_choice_rows answers "$@"; }
+cmd_reconciles() { cmd_choice_rows reconciles "$@"; }
+
 # Present one already-captured result for a handler. Body lines are prefixed
-# so a captain-supplied string cannot forge a section label. The session-ending
-# message is printed before the count line and before any annotation, because
-# that is the field a truncated grep of the raw capture historically dropped.
+# so a captain-supplied string cannot forge a section label. A freeform message
+# is printed before the count line and before any annotation, because that is
+# the field a truncated grep of the raw capture historically dropped.
 # A non-choice annotation that carries a freeform `prompt` prints that comment
 # as its own field; a selector must not hide the typed words, even when the
 # comment matches the captured element text. Choice rows keep Context data
@@ -561,15 +682,17 @@ cmd_read() {
       print "| $_\n" for @lines;
     }
     if (@messages) {
-      print "SESSION-ENDING MESSAGE\n";
+      my $message_label = $session_ended =~ /^(?:true|True|TRUE)$/
+        ? "SESSION-ENDING MESSAGE" : "CAPTAIN MESSAGE";
+      print "$message_label\n";
       for my $i (0 .. $#messages) {
-        print "SESSION-ENDING MESSAGE PART ", ($i + 1), " of ", scalar(@messages), "\n" if @messages > 1;
+        print "$message_label PART ", ($i + 1), " of ", scalar(@messages), "\n" if @messages > 1;
         my $body = defined $messages[$i]{prompt} && length $messages[$i]{prompt}
           ? $messages[$i]{prompt}
           : (defined $messages[$i]{text} ? $messages[$i]{text} : "");
         emit_body($body);
       }
-      print "END SESSION-ENDING MESSAGE\n";
+      print "END $message_label\n";
     } else {
       print "SESSION-ENDING MESSAGE: (none)\n";
     }
@@ -622,6 +745,7 @@ case "${1-}" in
   terminal)  shift; cmd_terminal "$@" ;;
   silent)    shift; cmd_silent "$@" ;;
   answers)   shift; cmd_answers "$@" ;;
+  reconciles) shift; cmd_reconciles "$@" ;;
   read)      shift; cmd_read "$@" ;;
   ''|-h|--help|help) usage ;;
   *) die "unknown command: $1" ;;

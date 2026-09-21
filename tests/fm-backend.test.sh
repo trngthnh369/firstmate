@@ -37,6 +37,13 @@ fm_git_identity fmtest fmtest@example.invalid
 . "$ROOT/bin/fm-backend.sh"
 
 TMP_ROOT=$(fm_test_tmproot fm-backend-tests)
+# A claude spawn writes workspace trust into the launching user's own store,
+# and the script resolves it as ${CLAUDE_CONFIG_DIR:-${HOME:-}}, so the value
+# is pinned EMPTY beside the throwaway HOME: an inherited one would beat that
+# HOME and reach the developer's real store, while empty falls through to it
+# and adds no launch prefix, since fm-spawn only prefixes a non-empty value.
+SPAWN_HOME="$TMP_ROOT/user-home"
+mkdir -p "$SPAWN_HOME"
 
 write_spawn_brief() {  # <file> <id>
   cat > "$1" <<EOF
@@ -393,9 +400,9 @@ test_backend_name_cmux_fallback_notice() {
 
 # fm_backend_name's auto-detect step: fires only when FM_BACKEND/config/backend
 # are both absent, selects between the three markers exactly as
-# fm_backend_detect does, and is loud only when it selects herdr or cmux -
-# never when it selects tmux (today's default-path behavior must stay
-# byte-for-byte silent).
+# fm_backend_detect does, and is loud only when it selects experimental cmux -
+# never when it selects verified herdr or tmux (today's default-path behavior
+# must stay byte-for-byte silent).
 test_backend_name_autodetect_notice() {
   local dir cfg out errfile
 
@@ -410,10 +417,7 @@ test_backend_name_autodetect_notice() {
   : > "$errfile"
   out=$(unset TMUX CMUX_WORKSPACE_ID; HERDR_ENV=1 FM_BACKEND='' FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_name 2>"$errfile")
   [ "$out" = herdr ] || fail "fm_backend_name should auto-detect herdr from HERDR_ENV=1, got '$out'"
-  assert_contains "$(cat "$errfile")" "EXPERIMENTAL herdr backend" \
-    "fm_backend_name did not print a loud notice when auto-detecting herdr"
-  assert_contains "$(cat "$errfile")" "config/backend" \
-    "fm_backend_name's auto-detect notice did not name the opt-out"
+  [ ! -s "$errfile" ] || fail "fm_backend_name must keep verified Herdr auto-detection silent"$'\n'"$(cat "$errfile")"
 
   : > "$errfile"
   out=$(unset HERDR_ENV CMUX_WORKSPACE_ID; TMUX='fake,1,0' FM_BACKEND='' FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_name 2>"$errfile")
@@ -440,7 +444,7 @@ test_backend_name_autodetect_notice() {
   [ "$out" = tmux ] || fail "nested tmux-in-cmux should auto-detect tmux (innermost first), got '$out'"
   [ -s "$errfile" ] && fail "nested tmux-in-cmux auto-detect (result tmux) must stay silent"$'\n'"$(cat "$errfile")"
 
-  pass "fm_backend_name: auto-detect selects herdr or cmux (loud notice) or tmux (silent, including nested tmux-in-herdr/tmux-in-cmux)"
+  pass "fm_backend_name: verified Herdr and tmux stay silent while experimental cmux remains loud"
 }
 
 # Explicit configuration (FM_BACKEND env or config/backend) always wins over
@@ -531,7 +535,7 @@ test_backend_validate_spawn_accepts_orca() {
 }
 
 test_meta_get_and_backend_of_meta() {
-  local meta=$TMP_ROOT/meta-get.meta
+  local meta=$TMP_ROOT/meta-get.meta edge=$TMP_ROOT/meta-get-edge.meta
   fm_write_meta "$meta" "window=firstmate:fm-x1" "harness=claude"
   [ "$(fm_meta_get "$meta" window)" = "firstmate:fm-x1" ] || fail "fm_meta_get did not read window="
   [ "$(fm_meta_get "$meta" missing)" = "" ] || fail "fm_meta_get should print nothing for an absent key"
@@ -540,7 +544,11 @@ test_meta_get_and_backend_of_meta() {
   printf 'backend=tmux\n' >> "$meta"
   [ "$(fm_backend_of_meta "$meta")" = tmux ] || fail "fm_backend_of_meta should read an explicit backend=tmux"
 
-  pass "fm_meta_get / fm_backend_of_meta: read key=value, default backend to tmux"
+  printf 'token=first\ntoken=last=value' > "$edge"
+  [ "$(fm_meta_get "$edge" token)" = "last=value" ] \
+    || fail "fm_meta_get did not preserve last-value or no-final-newline semantics"
+
+  pass "fm_meta_get / fm_backend_of_meta: read last key=value and default backend to tmux"
 }
 
 test_resolve_selector_three_forms() {
@@ -804,7 +812,7 @@ run_spawn_case() {  # <bin-root> <fakebin> <log> <state> <data> <config> <proj> 
   local bin=$1 fb=$2 log=$3 state=$4 data=$5 config=$6 proj=$7; shift 7
   [ "${1:-}" = -- ] && shift
   : > "$log"
-  env PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$bin" \
+  env PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$bin" HOME="$SPAWN_HOME" CLAUDE_CONFIG_DIR='' \
     FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
     FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" \
     FM_SPAWN_NO_GUARD=1 TMUX="fake,1,0" FM_TMUX_LOG="$log" \
@@ -1058,7 +1066,7 @@ test_spawn_default_backend_writes_no_meta_field() {
   state="$TMP_ROOT/nobackend-state"; config="$TMP_ROOT/nobackend-config"
   mkdir -p "$state" "$config"
 
-  out=$(PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$ROOT" \
+  out=$(PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$ROOT" HOME="$SPAWN_HOME" CLAUDE_CONFIG_DIR='' \
     FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
     FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 TMUX="fake,1,0" \
     FM_TMUX_LOG="$TMP_ROOT/nobackend.log" \
@@ -1082,7 +1090,7 @@ test_spawn_explicit_backend_flag_beats_autodetect_herdr_env() {
 
   # HERDR_ENV=1 is present (as if firstmate itself were running under herdr),
   # but an explicit --backend tmux flag must still win outright.
-  out=$(PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$ROOT" \
+  out=$(PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$ROOT" HOME="$SPAWN_HOME" CLAUDE_CONFIG_DIR='' \
     FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
     FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 TMUX="fake,1,0" HERDR_ENV=1 \
     FM_TMUX_LOG="$TMP_ROOT/explicit-backend.log" \
@@ -1109,7 +1117,7 @@ test_spawn_autodetect_nesting_resolves_tmux_silently() {
   # (tmux nested inside a herdr pane) - the full fm-spawn.sh pipeline, not just
   # fm_backend_name, must resolve this to tmux and stay completely silent about
   # it (today's default path, byte-identical).
-  out=$(PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$ROOT" \
+  out=$(PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$ROOT" HOME="$SPAWN_HOME" CLAUDE_CONFIG_DIR='' \
     FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
     FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 TMUX="fake,1,0" HERDR_ENV=1 \
     FM_TMUX_LOG="$TMP_ROOT/nest.log" \

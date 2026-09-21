@@ -27,8 +27,6 @@
 # shellcheck source=bin/fm-ps-lib.sh
 . "$(dirname -- "${BASH_SOURCE[0]}")/fm-ps-lib.sh"
 
-# Known harness command names; extend when a new adapter is verified.
-FM_HARNESS_RE='claude|codex|opencode|grok|kimi|^pi$|^pi-signed$'
 # Known harness command names; extend when a new adapter is verified. omp is
 # anchored exactly like pi: its process name is the bare word `omp` (verified,
 # omp 18.1.11), and a substring match would claim ompd or comp.

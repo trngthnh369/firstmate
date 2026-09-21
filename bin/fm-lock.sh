@@ -196,7 +196,7 @@ publish_lock_session_or_die() {
 confirm_own_lock() {  # <recorded-pid>
   local recorded waited=0
   if [ "$CLAIM_LOCK_HELD" -ne 1 ]; then
-    fm_lock_acquire_wait "$CLAIM_LOCK"
+    fm_lock_acquire_wait_or_die "$CLAIM_LOCK"
     CLAIM_LOCK_HELD=1
     waited=1
   fi

@@ -250,13 +250,31 @@ test_guard_warnings() {
   pass "guard banner leads when down with pending wakes (repair-after-drain) and stays silent when live and fresh"
 }
 
+# Block until <want> contenders have logged an attempt to <done_file>, then
+# create <release> so the winner lets go. It always releases, even on timeout,
+# so no contender is left spinning; the timeout itself fails the test.
+wait_all_contenders_done() {  # <done_file> <want> <release>
+  local done_file=$1 want=$2 release=$3 n=0 tries=0
+  while [ "$tries" -lt 600 ]; do
+    n=$(awk 'NF { c++ } END { print c + 0 }' "$done_file")
+    [ "$n" -ge "$want" ] && break
+    sleep 0.1
+    tries=$((tries + 1))
+  done
+  : > "$release"
+  [ "$n" -ge "$want" ] || fail "only $n of $want contenders finished an attempt within 60s"
+}
+
 test_lock_single_winner_under_concurrency() {
-  local dir state lockdir marker i pids pid wins
+  local dir state lockdir marker done_file release i pids pid wins
   dir=$(make_case lock-concurrency)
   state="$dir/state"
   lockdir="$state/.contend.lock"
   marker="$dir/wins"
+  done_file="$dir/done"
+  release="$dir/release"
   : > "$marker"
+  : > "$done_file"
   pids=
   i=1
   while [ "$i" -le 40 ]; do
@@ -264,14 +282,20 @@ test_lock_single_winner_under_concurrency() {
       . "$1"
       if fm_lock_try_acquire "$2"; then
         printf "%s\n" "$$" >> "$3"
-        # Stay alive so the held lock names a live pid for the whole window;
-        # otherwise a late contender could legitimately reclaim a dead-pid lock.
-        sleep 1
+        printf "x\n" >> "$4"
+        # Stay alive until every contender has finished its attempt so the held
+        # lock names a live pid for the whole window; otherwise a late contender
+        # could legitimately reclaim a dead-pid lock. A fixed sleep is not enough
+        # where spawning 40 shells is slow (MSYS/Git Bash).
+        while [ ! -e "$5" ]; do sleep 0.1; done
+      else
+        printf "x\n" >> "$4"
       fi
-    ' _ "$LIB" "$lockdir" "$marker" &
+    ' _ "$LIB" "$lockdir" "$marker" "$done_file" "$release" &
     pids="$pids $!"
     i=$((i + 1))
   done
+  wait_all_contenders_done "$done_file" 40 "$release"
   for pid in $pids; do
     wait "$pid" 2>/dev/null || true
   done
@@ -300,15 +324,18 @@ test_lock_steals_dead_pid_lock() {
 }
 
 test_lock_stale_steal_single_winner_under_concurrency() {
-  local dir state lockdir dead marker i pids pid wins
+  local dir state lockdir dead marker done_file release i pids pid wins
   dir=$(make_case lock-stale-concurrency)
   state="$dir/state"
   lockdir="$state/.contend.lock"
   marker="$dir/wins"
+  done_file="$dir/done"
+  release="$dir/release"
   dead=$(dead_pid)
   mkdir "$lockdir"
   printf '%s\n' "$dead" > "$lockdir/pid"
   : > "$marker"
+  : > "$done_file"
   pids=
   i=1
   while [ "$i" -le 40 ]; do
@@ -316,12 +343,16 @@ test_lock_stale_steal_single_winner_under_concurrency() {
       . "$1"
       if fm_lock_try_acquire "$2"; then
         printf "%s\n" "${BASHPID:-$$}" >> "$3"
-        sleep 1
+        printf "x\n" >> "$4"
+        while [ ! -e "$5" ]; do sleep 0.1; done
+      else
+        printf "x\n" >> "$4"
       fi
-    ' _ "$LIB" "$lockdir" "$marker" &
+    ' _ "$LIB" "$lockdir" "$marker" "$done_file" "$release" &
     pids="$pids $!"
     i=$((i + 1))
   done
+  wait_all_contenders_done "$done_file" 40 "$release"
   for pid in $pids; do
     wait "$pid" 2>/dev/null || true
   done
